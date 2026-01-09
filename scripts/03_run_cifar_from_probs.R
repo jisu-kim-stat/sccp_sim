@@ -46,9 +46,9 @@ load_cifar_npz <- function(npz_path){
 # Run from npz file
 ## ----------------------------
 
-run_once_from_npz <- function(npz_path, alpha = 0.05, Kc = 10){
-  library(reticulate)
-  np <- import("numpy")
+run_once_from_npz <- function(npz_path, alpha = 0.05, Kc = 10) {
+  if (!requireNamespace("reticulate", quietly = TRUE)) stop("need reticulate")
+  np <- reticulate::import("numpy", delay_load = TRUE)
 
   z <- np$load(npz_path, allow_pickle = TRUE)
 
@@ -68,9 +68,7 @@ run_once_from_npz <- function(npz_path, alpha = 0.05, Kc = 10){
     p_mat[cbind(seq_len(nrow(p_mat)), idx)]
   }
 
-  s_sel <- 1 - get_true_prob(p_sel, y_sel)
   s_cal <- 1 - get_true_prob(p_cal, y_cal)
-
   qG_cal <- conformal_quantile(s_cal, alpha)
 
   pred_G <- lapply(seq_len(nrow(p_tst)), function(i){
