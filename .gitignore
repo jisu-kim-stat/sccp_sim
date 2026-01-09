@@ -1,3 +1,17 @@
+
+# R session junk
+.RData
+.Rhistory
+.Rproj.user/
+
+# CIFAR raw data
+data/
+vision/data/
+**/*.tar.gz
+**/*.npz
+out/
+vision/out/
+
 # outputs
 out/
 vision/out/
