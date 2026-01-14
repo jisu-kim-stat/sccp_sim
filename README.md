@@ -83,9 +83,16 @@ python run_cp_from_npz.py \
 - `K` : number of class (iNat2017의 경우 5089)
 
 ### 비교 방법
-- `GCP` : Global Conformal Prediction 
-- `CCCP` : Class-Conditioanl Conformal Prediction (Ding2023)
-- `SCCP` : Shrinakge Class-Clustered Conformal Prediction (Our Proposed Method)
+- **GCP (Global Conformal Prediction)**  
+  A baseline conformal prediction method using a global threshold  
+  [Vovk et al., 2005; Angelopoulos et al., 2022].
+
+- **CC-CP (Class-Conditional Conformal Prediction)**  
+  Class-wise conformal thresholds  
+  [Ding et al., 2023].
+
+- **SCCP (Shrinkage-Clustered Conformal Prediction)**  
+  Clustered and shrinkage-based conformal thresholds (ours).
 
 ---
 
@@ -140,6 +147,11 @@ Mean lambda: 0.38
 
 
 # References
-Ding, T., Angelopoulos, A. N., Bates, S., Jordan, M. I., and Tibshirani, R. J. (2023).
-*Class-Conditional Conformal Prediction with Many Classes*.
-Advances in Neural Information Processing Systems (NeurIPS 2023).
+- Vovk, V., Gammerman, A., and Shafer, G. (2005).
+*Algorithmic Learning in a Random World*.
+Springer.
+
+- Angelopoulos, A. N., Bates, S., Malik, J., and Jordan, M. I. (2022).
+*Uncertainty Sets for Image Classifiers using Conformal Prediction*.
+Advances in Neural Information Processing Systems (NeurIPS 2022).
+
