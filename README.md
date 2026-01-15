@@ -95,16 +95,6 @@ data/npz/
 ---
 
 ## 4. Conformal Prediction
-### 공통 실행 예시
-```bash
-python run_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_selA_calB_test_mnv3s_fz_t50k_ep5_seed1.npz \
-  --alpha 0.1 \
-  --K 5089 \
-  --method all
-```
-- `alpha` : miscoverage level (e.g. 0.05)
-- `K` : number of class (iNat2017의 경우 5089)
 
 ### 비교 방법
 - **GCP (Global Conformal Prediction)**  
