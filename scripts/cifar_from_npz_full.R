@@ -17,7 +17,6 @@ conformal_quantile <- function(scores, alpha) {
   scores[k]
 }
 
-# Base metrics (overall)
 eval_metrics <- function(pred_sets, y_true, K) {
   covered <- map2_lgl(pred_sets, y_true, ~ (.y %in% .x))
   tibble(
@@ -28,22 +27,18 @@ eval_metrics <- function(pred_sets, y_true, K) {
 }
 
 # ----------------------------
-# Tail-focused + classwise metrics 
+# Tail / classwise
 # ----------------------------
-
-# Define tail classes using a reference label sample (recommend: y_cal)
-# tail_frac = proportion of rare classes (e.g., 0.2 => bottom 20% by frequency)
 get_tail_classes <- function(y_ref, K, tail_frac = 0.2) {
   y_ref <- as.integer(y_ref)
   tab <- tabulate(y_ref, nbins = K)
   cls <- seq_len(K)
-  ord <- order(tab, decreasing = FALSE) # rare -> frequent
+  ord <- order(tab, decreasing = FALSE)
   m <- max(1, ceiling(K * tail_frac))
   tail_cls <- cls[ord[1:m]]
   list(tail_cls = tail_cls, freq = tab)
 }
 
-# Compute tail-only metrics given pred_sets + y_true + tail_cls
 eval_metrics_tail <- function(pred_sets, y_true, tail_cls) {
   y_true <- as.integer(y_true)
   is_tail <- y_true %in% tail_cls
@@ -55,10 +50,8 @@ eval_metrics_tail <- function(pred_sets, y_true, tail_cls) {
       n_tail = 0L
     ))
   }
-
   covered <- map2_lgl(pred_sets, y_true, ~ (.y %in% .x))
   ss <- lengths(pred_sets)
-
   tibble(
     overall_cov_tail = mean(covered[is_tail]),
     mean_set_size_tail = mean(ss[is_tail]),
@@ -67,14 +60,12 @@ eval_metrics_tail <- function(pred_sets, y_true, tail_cls) {
   )
 }
 
-# Classwise coverage table
 eval_classwise_cov <- function(pred_sets, y_true, K) {
   y_true <- as.integer(y_true)
   covered <- map2_lgl(pred_sets, y_true, ~ (.y %in% .x))
 
-  # Ensure all classes 1..K are present
   cov_by_class <- rep(NA_real_, K)
-  n_by_class   <- tabulate(y_true, nbins = K)
+  n_by_class <- tabulate(y_true, nbins = K)
 
   for (k in seq_len(K)) {
     idx <- which(y_true == k)
@@ -88,7 +79,6 @@ eval_classwise_cov <- function(pred_sets, y_true, K) {
   )
 }
 
-# Summaries that often show SCCP gains
 summarize_classwise <- function(df_classwise, tail_cls) {
   df_tail <- df_classwise %>% filter(.data$y %in% tail_cls, .data$n > 0)
   df_all  <- df_classwise %>% filter(.data$n > 0)
@@ -102,14 +92,11 @@ summarize_classwise <- function(df_classwise, tail_cls) {
 }
 
 # ----------------------------
-# Clusterwise metrics (NEW)
-# label_clusters: integer vector length K (label -> cluster id in 1..Kc_eff)
+# Clusterwise metrics
 # ----------------------------
-
 eval_clusterwise_metrics <- function(pred_sets, y_true, label_clusters, Kc_eff = NULL) {
   y_true <- as.integer(y_true)
   cl_true <- label_clusters[y_true]
-
   if (is.null(Kc_eff)) Kc_eff <- max(label_clusters)
 
   covered <- map2_lgl(pred_sets, y_true, ~ (.y %in% .x))
@@ -137,7 +124,6 @@ eval_clusterwise_metrics <- function(pred_sets, y_true, label_clusters, Kc_eff =
 
 summarize_clusterwise <- function(df_clusterwise) {
   df_ok <- df_clusterwise %>% filter(.data$n > 0)
-
   tibble(
     worst_cluster_cov = if (nrow(df_ok) > 0) min(df_ok$cov, na.rm = TRUE) else NA_real_,
     var_cluster_cov   = if (nrow(df_ok) > 1) var(df_ok$cov, na.rm = TRUE) else NA_real_,
@@ -163,264 +149,291 @@ build_pred_set_cluster <- function(p_row, label_clusters, q_by_cluster) {
   labels[s_vec <= th_vec]
 }
 
-# ----------------------------
-# Label clustering (k-means on score embeddings)
-# scores_by_label: list, index by label (1..K), values are scores for that label
-# ----------------------------
-label_kmeans <- function(scores_by_label,
-                         Kc = 10,
-                         alpha = 0.05,
-                         quantiles = c(.5, .6, .7, .8, .9, 1 - alpha)) {
+# ============================================================
+# CCCP-style clustering: quantile embedding + null + weighted k-means
+# ============================================================
+min_count_for_null <- function(alpha) {
+  thr <- (1 / min(alpha, 0.1)) - 1
+  floor(thr)
+}
+
+weighted_kmeans <- function(X, centers, weights, iter_max = 50, nstart = 5, seed = 1) {
+  set.seed(seed)
+  X <- as.matrix(X)
+  n <- nrow(X); d <- ncol(X)
+  w <- as.numeric(weights)
+  w <- pmax(w, 0)
+
+  best_tot <- Inf
+  best_cluster <- NULL
+
+  w_center <- function(Xc, wc) {
+    if (length(wc) == 0 || sum(wc) <= 0) return(colMeans(Xc))
+    colSums(Xc * wc) / sum(wc)
+  }
+
+  for (s in seq_len(nstart)) {
+    if (sum(w) > 0) {
+      idx <- sample.int(n, size = centers, replace = FALSE, prob = w / sum(w))
+    } else {
+      idx <- sample.int(n, size = centers, replace = FALSE)
+    }
+    mu <- X[idx, , drop = FALSE]
+    cl <- rep(1L, n)
+
+    for (it in seq_len(iter_max)) {
+      d2 <- sapply(seq_len(centers), function(k) rowSums((X - matrix(mu[k, ], n, d, byrow = TRUE))^2))
+      new_cl <- max.col(-d2)
+      if (all(new_cl == cl)) break
+      cl <- new_cl
+
+      for (k in seq_len(centers)) {
+        ik <- which(cl == k)
+        if (length(ik) == 0) {
+          if (sum(w) > 0) {
+            ridx <- sample.int(n, size = 1, prob = w / sum(w))
+          } else {
+            ridx <- sample.int(n, size = 1)
+          }
+          mu[k, ] <- X[ridx, ]
+        } else {
+          mu[k, ] <- w_center(X[ik, , drop = FALSE], w[ik])
+        }
+      }
+    }
+
+    tot <- 0
+    for (k in seq_len(centers)) {
+      ik <- which(cl == k)
+      if (length(ik) > 0) {
+        dif <- X[ik, , drop = FALSE] - matrix(mu[k, ], length(ik), d, byrow = TRUE)
+        tot <- tot + sum(w[ik] * rowSums(dif^2))
+      }
+    }
+
+    if (tot < best_tot) {
+      best_tot <- tot
+      best_cluster <- cl
+    }
+  }
+
+  list(cluster = best_cluster, tot_withinss = best_tot)
+}
+
+label_kmeans_cccp_style <- function(scores_by_label,
+                                    Kc = 10,
+                                    alpha = 0.05,
+                                    quantiles = c(.5, .6, .7, .8, .9, 1 - alpha),
+                                    seed = 1) {
 
   quantiles <- sort(unique(quantiles))
   K <- length(scores_by_label)
-  emb <- matrix(NA_real_, nrow = K, ncol = length(quantiles))
 
-  for (k in seq_len(K)) {
+  n_y <- sapply(seq_len(K), function(k) {
     v <- scores_by_label[[as.character(k)]]
-    if (is.null(v)) v <- numeric(0)
-    if (length(v) < 5) {
-      fill <- if (length(v) == 0) 0.5 else median(v, na.rm = TRUE)
-      v <- c(v, rep(fill, 5 - length(v)))
-    }
-    emb[k, ] <- quantile(v, probs = quantiles, na.rm = TRUE, type = 8)
-  }
-
-  Kc_eff <- min(Kc, K)
-  km <- kmeans(scale(emb), centers = Kc_eff, nstart = 10)
-  km$cluster
-}
-
-merge_small_clusters <- function(label_clusters, y_cal, m_min = 100) {
-  cl_idx <- label_clusters[y_cal]
-  cl_counts <- tabulate(cl_idx, nbins = max(label_clusters))
-  small <- which(cl_counts < m_min)
-  if (length(small) == 0) return(label_clusters)
-
-  big <- which.max(cl_counts)
-  lab <- label_clusters
-  for (c in small) lab[lab == c] <- big
-  uniq <- sort(unique(lab))
-  match(lab, uniq)
-}
-
-# ----------------------------
-# Lambda selection on selection split (cluster-wise)
-# qC_sel: length Kc_eff
-# qG_sel: scalar
-# ----------------------------
-choose_lambda_by_selection <- function(
-    p_sel, y_sel, label_clusters_sel,
-    alpha, qC_sel, qG_sel,
-    grid = seq(0, 1, by = 0.1)
-) {
-  Kc_eff <- length(qC_sel)
-  best_lambda <- rep(NA_real_, Kc_eff)
-
-  cand_lmb <- sort(unique(grid))
-
-  cand <- lapply(cand_lmb, function(lmb) {
-    q_star <- (1 - lmb) * qC_sel + lmb * qG_sel
-    pred_sets <- lapply(seq_len(nrow(p_sel)), function(i) {
-      pr <- p_sel[i, ]; names(pr) <- colnames(p_sel)
-      build_pred_set_cluster(pr, label_clusters_sel, q_star)
-    })
-    covered <- mapply(function(ps, y) y %in% ps, pred_sets, y_sel)
-    list(pred_sets = pred_sets, covered = covered)
+    if (is.null(v)) 0L else length(v)
   })
 
-  mean_size_vec <- sapply(cand, function(o) mean(lengths(o$pred_sets)))
-  cov_overall_vec <- sapply(cand, function(o) mean(o$covered))
+  n_min <- min_count_for_null(alpha)
+  is_null <- n_y < n_min
 
-  for (cc in seq_len(Kc_eff)) {
-    idx_cc <- which(label_clusters_sel[y_sel] == cc)
+  all_scores <- unlist(scores_by_label, use.names = FALSE)
+  global_q <- if (length(all_scores) == 0) rep(0.5, length(quantiles)) else
+    as.numeric(quantile(all_scores, probs = quantiles, na.rm = TRUE, type = 8))
 
-    if (length(idx_cc) == 0) {
-      best_lambda[cc] <- 1
-      next
-    }
-
-    cov_cc_vec <- sapply(cand, function(o) mean(o$covered[idx_cc]))
-
-    eval_tbl <- tibble(
-      lambda      = cand_lmb,
-      mean_size   = mean_size_vec,
-      cov_cc      = cov_cc_vec,
-      cov_overall = cov_overall_vec
-    )
-
-    feas <- eval_tbl %>% filter(cov_cc >= (1 - alpha), cov_overall >= (1 - alpha))
-
-    if (nrow(feas) > 0) {
-      chosen <- feas %>% arrange(mean_size, desc(cov_cc), desc(cov_overall)) %>% slice(1)
+  emb <- matrix(NA_real_, nrow = K, ncol = length(quantiles))
+  for (k in seq_len(K)) {
+    v <- scores_by_label[[as.character(k)]]
+    if (is.null(v) || length(v) == 0) {
+      emb[k, ] <- global_q
+    } else if (!is_null[k]) {
+      emb[k, ] <- as.numeric(quantile(v, probs = quantiles, na.rm = TRUE, type = 8))
     } else {
-      chosen <- eval_tbl %>%
-        mutate(
-          viol_cc      = pmax(0, (1 - alpha) - cov_cc),
-          viol_overall = pmax(0, (1 - alpha) - cov_overall),
-          loss         = viol_cc + viol_overall + mean_size
-        ) %>%
-        arrange(loss, mean_size) %>%
-        slice(1)
+      emb[k, ] <- global_q
     }
-
-    best_lambda[cc] <- chosen$lambda
   }
 
-  best_lambda[is.na(best_lambda)] <- 1
-  best_lambda
+  idx_nonnull <- which(!is_null)
+  if (length(idx_nonnull) == 0) {
+    label_clusters <- rep(1L, K)
+    return(list(label_clusters = label_clusters, Kc_eff = 1L, is_null = is_null, n_min = n_min))
+  }
+
+  X <- scale(emb[idx_nonnull, , drop = FALSE])
+  w <- sqrt(pmax(n_y[idx_nonnull], 0))
+
+  Kc_eff_nonnull <- min(Kc, length(idx_nonnull))
+  km <- weighted_kmeans(X, centers = Kc_eff_nonnull, weights = w, iter_max = 50, nstart = 5, seed = seed)
+
+  # non-null: 1..Kc_eff_nonnull, null: Kc_eff_nonnull+1
+  label_clusters <- rep(Kc_eff_nonnull + 1L, K)
+  label_clusters[idx_nonnull] <- km$cluster
+  Kc_eff <- Kc_eff_nonnull + 1L
+
+  list(label_clusters = label_clusters, Kc_eff = Kc_eff, is_null = is_null, n_min = n_min)
+}
+
+# ============================================================
+# NEW: tau-shrinkage for cluster thresholds
+# ============================================================
+shrink_cluster_thresholds <- function(qC_cal, qG_cal, n_cluster_cal, tau) {
+  # w_c = n_c/(n_c+tau)
+  w <- n_cluster_cal / (n_cluster_cal + tau)
+  w[!is.finite(w)] <- 0
+  as.numeric(w * qC_cal + (1 - w) * qG_cal)
 }
 
 # ----------------------------
-# Main: Run GCP / CCCP / SCCP from NPZ
+# Main: Run GCP / CCCP / SCCP(tau) from NPZ
 # ----------------------------
 run_cifar_from_npz <- function(npz_path,
                                alpha = 0.05,
                                Kc = 10,
-                               m_min = 100,
-                               lambda_grid = seq(0, 1, by = 0.1),
-                               tail_frac = 0.2) {
+                               tau = 50,
+                               tail_frac = 0.2,
+                               seed = 1,
+                               quantiles = c(.5, .6, .7, .8, .9, 1 - alpha)) {
 
   np <- reticulate::import("numpy", delay_load = TRUE)
   z  <- np$load(npz_path, allow_pickle = TRUE)
 
-  p_sel <- as.matrix(z[["p_sel"]])
+  # NOTE: sel split은 이제 필요 없지만, 파일에 있으면 읽어도 무방
   p_cal <- as.matrix(z[["p_cal"]])
   p_tst <- as.matrix(z[["p_tst"]])
 
-  y_sel <- as.integer(z[["y_sel"]]) + 1L
   y_cal <- as.integer(z[["y_cal"]]) + 1L
   y_tst <- as.integer(z[["y_tst"]]) + 1L
 
   K <- ncol(p_cal)
-  colnames(p_sel) <- colnames(p_cal) <- colnames(p_tst) <- as.character(seq_len(K))
+  colnames(p_cal) <- colnames(p_tst) <- as.character(seq_len(K))
 
   get_true_prob <- function(p_mat, y) {
     idx <- match(as.character(y), colnames(p_mat))
     p_mat[cbind(seq_len(nrow(p_mat)), idx)]
   }
 
-  s_sel_true <- 1 - get_true_prob(p_sel, y_sel)
   s_cal_true <- 1 - get_true_prob(p_cal, y_cal)
 
-  # Tail classes defined from calibration labels (recommended; avoids using test)
   tail_info <- get_tail_classes(y_ref = y_cal, K = K, tail_frac = tail_frac)
   tail_cls <- tail_info$tail_cls
 
-  # ---- GCP
+  # 1) clustering (from calibration scores)
+  scores_by_label_cal <- split(s_cal_true, y_cal)
+  scores_by_label_cal <- scores_by_label_cal[as.character(seq_len(K))]
+  for (k in seq_len(K)) if (is.null(scores_by_label_cal[[k]])) scores_by_label_cal[[k]] <- numeric(0)
+
+  clu_obj <- label_kmeans_cccp_style(
+    scores_by_label = scores_by_label_cal,
+    Kc = Kc,
+    alpha = alpha,
+    quantiles = quantiles,
+    seed = seed
+  )
+  label_clusters <- clu_obj$label_clusters
+  Kc_eff <- clu_obj$Kc_eff
+  null_id <- Kc_eff
+
+  # 2) global threshold
   qG_cal <- conformal_quantile(s_cal_true, alpha)
+
+  # 3) cluster thresholds on calibration + null forced to global
+  cl_cal <- label_clusters[y_cal]
+  n_cluster_cal <- tabulate(cl_cal, nbins = Kc_eff)
+
+  qC_cal <- sapply(seq_len(Kc_eff), function(cc) {
+    if (cc == null_id) return(qG_cal)
+    idx <- which(cl_cal == cc)
+    if (length(idx) == 0) return(qG_cal)
+    conformal_quantile(s_cal_true[idx], alpha)
+  })
+
+  # 4) SCCP(tau): shrink cluster thresholds toward global using n_cluster_cal
+  q_star <- qC_cal
+  q_star[seq_len(Kc_eff)] <- shrink_cluster_thresholds(qC_cal, qG_cal, n_cluster_cal, tau = tau)
+  q_star[null_id] <- qG_cal  # null은 무조건 global
+
+  # ------------------------------------------------------------
+  # Prediction sets + metrics
+  # ------------------------------------------------------------
+
+  # ---- GCP
   pred_GCP <- lapply(seq_len(nrow(p_tst)), function(i) {
     pr <- p_tst[i, ]; names(pr) <- colnames(p_tst)
     build_pred_set_global(pr, qG_cal)
   })
+
   met_GCP_overall <- eval_metrics(pred_GCP, y_tst, K)
   met_GCP_tail    <- eval_metrics_tail(pred_GCP, y_tst, tail_cls)
-
-  cw_GCP <- eval_classwise_cov(pred_GCP, y_tst, K)
+  cw_GCP  <- eval_classwise_cov(pred_GCP, y_tst, K)
   sum_GCP <- summarize_classwise(cw_GCP, tail_cls)
-
-  clw_GCP  <- eval_clusterwise_metrics(pred_GCP, y_tst, label_clusters, Kc_eff = Kc_eff)
+  clw_GCP   <- eval_clusterwise_metrics(pred_GCP, y_tst, label_clusters, Kc_eff = Kc_eff)
   clsum_GCP <- summarize_clusterwise(clw_GCP)
 
-  
-
-
-  # ---- CC-CP
-  scores_by_label_cal <- split(s_cal_true, y_cal)
-  scores_by_label_cal <- scores_by_label_cal[as.character(seq_len(K))]
-
-  label_clusters <- label_kmeans(scores_by_label_cal, Kc = Kc, alpha = alpha,
-                                 quantiles = c(.5, .6, .7, .8, .9, 1 - alpha))
-  label_clusters <- merge_small_clusters(label_clusters, y_cal, m_min = m_min)
-  Kc_eff <- length(unique(label_clusters))
-
-  qC_cal <- sapply(seq_len(Kc_eff), function(cc) {
-    idx <- which(label_clusters[y_cal] == cc)
-    conformal_quantile(s_cal_true[idx], alpha)
-  })
-
+  # ---- CCCP (cluster thresholds; null is global)
   pred_CCCP <- lapply(seq_len(nrow(p_tst)), function(i) {
     pr <- p_tst[i, ]; names(pr) <- colnames(p_tst)
     build_pred_set_cluster(pr, label_clusters, qC_cal)
   })
+
   met_CCCP_overall <- eval_metrics(pred_CCCP, y_tst, K)
   met_CCCP_tail    <- eval_metrics_tail(pred_CCCP, y_tst, tail_cls)
-
-  cw_CCCP <- eval_classwise_cov(pred_CCCP, y_tst, K)
+  cw_CCCP  <- eval_classwise_cov(pred_CCCP, y_tst, K)
   sum_CCCP <- summarize_classwise(cw_CCCP, tail_cls)
-
-  clw_CCCP  <- eval_clusterwise_metrics(pred_CCCP, y_tst, label_clusters, Kc_eff = Kc_eff)
+  clw_CCCP   <- eval_clusterwise_metrics(pred_CCCP, y_tst, label_clusters, Kc_eff = Kc_eff)
   clsum_CCCP <- summarize_clusterwise(clw_CCCP)
 
-
-  # ---- SCC-CP
-  qC_sel <- sapply(seq_len(Kc_eff), function(cc) {
-    idx <- which(label_clusters[y_sel] == cc)
-    conformal_quantile(s_sel_true[idx], alpha)
-  })
-  qG_sel <- conformal_quantile(s_sel_true, alpha)
-
-  lambda_hat <- choose_lambda_by_selection(
-    p_sel = p_sel, y_sel = y_sel,
-    label_clusters_sel = label_clusters,
-    alpha = alpha,
-    qC_sel = qC_sel, qG_sel = qG_sel,
-    grid = lambda_grid
-  )
-
-  q_star <- (1 - lambda_hat) * qC_cal + lambda_hat * qG_cal
-
+  # ---- SCCP(tau)
   pred_SCCP <- lapply(seq_len(nrow(p_tst)), function(i) {
     pr <- p_tst[i, ]; names(pr) <- colnames(p_tst)
     build_pred_set_cluster(pr, label_clusters, q_star)
   })
+
   met_SCCP_overall <- eval_metrics(pred_SCCP, y_tst, K)
   met_SCCP_tail    <- eval_metrics_tail(pred_SCCP, y_tst, tail_cls)
-
-  cw_SCCP <- eval_classwise_cov(pred_SCCP, y_tst, K)
+  cw_SCCP  <- eval_classwise_cov(pred_SCCP, y_tst, K)
   sum_SCCP <- summarize_classwise(cw_SCCP, tail_cls)
-
-  clw_SCCP  <- eval_clusterwise_metrics(pred_SCCP, y_tst, label_clusters, Kc_eff = Kc_eff)
+  clw_SCCP   <- eval_clusterwise_metrics(pred_SCCP, y_tst, label_clusters, Kc_eff = Kc_eff)
   clsum_SCCP <- summarize_clusterwise(clw_SCCP)
-
 
   # ---- Output tables
   overall_tbl <- bind_rows(
     met_GCP_overall  %>% mutate(method = "GCP"),
     met_CCCP_overall %>% mutate(method = "CCCP"),
-    met_SCCP_overall %>% mutate(method = "SCCP")
+    met_SCCP_overall %>% mutate(method = "SCCP_tau")
   )
 
   tail_tbl <- bind_rows(
     met_GCP_tail  %>% mutate(method = "GCP"),
     met_CCCP_tail %>% mutate(method = "CCCP"),
-    met_SCCP_tail %>% mutate(method = "SCCP")
+    met_SCCP_tail %>% mutate(method = "SCCP_tau")
   )
+
   classwise_summary_tbl <- bind_rows(
     sum_GCP  %>% mutate(method = "GCP"),
     sum_CCCP %>% mutate(method = "CCCP"),
-    sum_SCCP %>% mutate(method = "SCCP")
+    sum_SCCP %>% mutate(method = "SCCP_tau")
   )
 
-  clusterwise_summary_tbl = bind_rows(
-  clsum_GCP  %>% mutate(method = "GCP"),
-  clsum_CCCP %>% mutate(method = "CCCP"),
-  clsum_SCCP %>% mutate(method = "SCCP")
+  clusterwise_summary_tbl <- bind_rows(
+    clsum_GCP  %>% mutate(method = "GCP"),
+    clsum_CCCP %>% mutate(method = "CCCP"),
+    clsum_SCCP %>% mutate(method = "SCCP_tau")
   )
-
 
   list(
     overall = overall_tbl,
     tail = tail_tbl,
     classwise_summary = classwise_summary_tbl,
     clusterwise_summary = clusterwise_summary_tbl,
-    classwise = list(GCP = cw_GCP, CCCP = cw_CCCP, SCCP = cw_SCCP),
-    clusterwise = list(GCP = clw_GCP, CCCP = clw_CCCP, SCCP = clw_SCCP),
+    classwise = list(GCP = cw_GCP, CCCP = cw_CCCP, SCCP_tau = cw_SCCP),
+    clusterwise = list(GCP = clw_GCP, CCCP = clw_CCCP, SCCP_tau = clw_SCCP),
     tail_info = list(tail_frac = tail_frac, tail_classes = tail_cls, freq_cal = tail_info$freq),
     label_clusters = label_clusters,
-    lambda_hat = lambda_hat,
+    Kc_eff = Kc_eff,
     qG_cal = qG_cal,
     qC_cal = qC_cal,
-    q_star = q_star
+    q_star = q_star,
+    n_cluster_cal = n_cluster_cal,
+    tau = tau
   )
 }

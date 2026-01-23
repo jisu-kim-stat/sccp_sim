@@ -3,6 +3,178 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
+#----------------------------
+# CCCP Utilities #
+#----------------------------
+import numpy as np
+from typing import Optional, Tuple
+
+def min_count_for_null(alpha: float) -> int:
+    """
+    CCCP-style null-cluster criterion:
+      if n_y < (1 / min(alpha, 0.1)) - 1  => null cluster
+    """
+    thr = (1.0 / min(alpha, 0.1)) - 1.0
+    # "보다 작으면" 이므로 정수화는 floor 성격이 자연스러움
+    return int(np.floor(thr))
+
+def weighted_kmeans_simple(
+    X: np.ndarray,
+    n_clusters: int,
+    weights: np.ndarray,
+    seed: int = 1,
+    n_iter: int = 50,
+) -> np.ndarray:
+    """
+    Minimal weighted k-means:
+      - assignment: Euclidean distance
+      - update: weighted mean with weights
+    """
+    rng = np.random.default_rng(seed)
+    N, d = X.shape
+    w = np.asarray(weights, dtype=float)
+    w = np.clip(w, 0.0, None)
+
+    # init centers: sample points proportional to weights (fallback to uniform)
+    if w.sum() > 0:
+        p = w / w.sum()
+        init_idx = rng.choice(N, size=n_clusters, replace=False, p=p)
+    else:
+        init_idx = rng.choice(N, size=n_clusters, replace=False)
+
+    centers = X[init_idx].copy()
+    labels = np.zeros(N, dtype=int)
+
+    for _ in range(n_iter):
+        # assign
+        d2 = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        new_labels = d2.argmin(axis=1)
+        if np.all(new_labels == labels):
+            break
+        labels = new_labels
+
+        # update (weighted mean)
+        for c in range(n_clusters):
+            m = (labels == c)
+            if not m.any():
+                # re-init empty cluster
+                if w.sum() > 0:
+                    idx = rng.choice(N, p=w / w.sum())
+                else:
+                    idx = rng.integers(0, N)
+                centers[c] = X[idx]
+                continue
+
+            wm = w[m]
+            if wm.sum() <= 0:
+                centers[c] = X[m].mean(axis=0)
+            else:
+                centers[c] = (X[m] * wm[:, None]).sum(axis=0) / wm.sum()
+
+    return labels
+
+def class_quantile_embedding_with_null(
+    scores_sel: np.ndarray,
+    y_sel: np.ndarray,
+    K: int,
+    q_grid: np.ndarray,
+    alpha: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      emb: (K, d) quantile embedding (global quantiles used as filler for non-null only if needed)
+      n_y: (K,) counts in sel
+      is_null: (K,) boolean indicating null-cluster classes
+    """
+    q_grid = np.asarray(q_grid, dtype=float)
+    d = len(q_grid)
+
+    y_sel = np.asarray(y_sel, dtype=int)
+    scores_sel = np.asarray(scores_sel, dtype=float)
+
+    n_y = np.bincount(y_sel, minlength=K)
+    n_min = min_count_for_null(alpha)
+    is_null = n_y < n_min  # strict "<" as you specified
+
+    # global quantiles (for numerical safety / fallback)
+    global_q = np.quantile(scores_sel, q_grid, method="higher")
+
+    emb = np.zeros((K, d), dtype=float)
+    for k in range(K):
+        mk = (y_sel == k)
+        if mk.any() and (not is_null[k]):
+            emb[k] = np.quantile(scores_sel[mk], q_grid, method="higher")
+        else:
+            # null classes: embedding value won't be used in clustering
+            # but fill with global_q to avoid NaNs
+            emb[k] = global_q
+
+    # numerical safety
+    bad = ~np.isfinite(emb)
+    if bad.any():
+        emb[bad] = np.take(global_q, np.where(bad)[1])
+
+    return emb, n_y.astype(int), is_null
+
+def cluster_classes_cccp_style(
+    scores_sel: np.ndarray,
+    y_sel: np.ndarray,
+    K: int,
+    q_grid: np.ndarray,
+    alpha: float,
+    n_clusters: int,
+    seed: int,
+) -> Tuple[np.ndarray, int, np.ndarray]:
+    """
+    CCCP-style clustering:
+      1) null cluster assignment by n_y < (1/min(alpha,0.1))-1
+      2) run weighted k-means on remaining classes with weight sqrt(n_y)
+      3) return class2cluster where null classes map to an extra cluster index (n_clusters)
+    
+    Returns:
+      class2cluster: (K,) in {0,...,n_clusters}  (last id = null cluster)
+      C_eff: n_clusters + 1
+      is_null: (K,)
+    """
+    emb, n_y, is_null = class_quantile_embedding_with_null(
+        scores_sel=scores_sel,
+        y_sel=y_sel,
+        K=K,
+        q_grid=q_grid,
+        alpha=alpha,
+    )
+
+    idx_nonnull = np.where(~is_null)[0]
+    idx_null = np.where(is_null)[0]
+
+    # If all are null (extreme case), everything goes to null cluster
+    if len(idx_nonnull) == 0:
+        class2cluster = np.full(K, n_clusters, dtype=int)
+        return class2cluster, n_clusters + 1, is_null
+
+    X = emb[idx_nonnull]
+    w = np.sqrt(np.maximum(n_y[idx_nonnull], 0)).astype(float)
+
+    # If fewer non-null classes than clusters, reduce clusters
+    Kc = min(n_clusters, len(idx_nonnull))
+    labels_nonnull = weighted_kmeans_simple(X, n_clusters=Kc, weights=w, seed=seed)
+
+    # Map back to full K, and reserve last cluster id = null cluster
+    class2cluster = np.full(K, n_clusters, dtype=int)  # default null cluster id
+    class2cluster[idx_nonnull] = labels_nonnull
+
+    # Effective cluster count:
+    # - non-null clusters: 0..Kc-1
+    # - (optional) unused cluster ids if Kc<n_clusters are fine but we will compress to Kc
+    # - null cluster id: Kc
+    # To keep things clean, compress cluster ids to 0..Kc-1 then null=Kc
+    # (This avoids "max cluster id" mismatches later.)
+    # relabel non-null cluster ids to 0..Kc-1 already; set null to Kc
+    class2cluster[idx_null] = Kc
+    C_eff = Kc + 1
+
+    return class2cluster, C_eff, is_null
+
 # ----------------------------
 # Utilities: load & auto-detect arrays
 # ----------------------------
@@ -166,6 +338,38 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
 
     return splits
 
+# ----------------------------
+# Utilities : tail/head index metrics
+# ----------------------------
+import numpy as np
+
+def split_tail_head(K: int, tail_set: np.ndarray):
+    tail_set = np.asarray(tail_set, dtype=int)
+    tail_mask = np.zeros(K, dtype=bool)
+    tail_mask[tail_set] = True
+    head_mask = ~tail_mask
+    tail_idx = np.where(tail_mask)[0]
+    head_idx = np.where(head_mask)[0]
+    return tail_idx, head_idx
+
+def summarize(arr: np.ndarray):
+    arr = np.asarray(arr, dtype=float)
+    return {
+        "avg": float(np.nanmean(arr)),
+        "worst": float(np.nanmin(arr)),
+        "std": float(np.nanstd(arr)),
+    }
+
+def report_tail_head(method_name: str, cls_cov: np.ndarray, tail_idx: np.ndarray, head_idx: np.ndarray):
+    tail_sum = summarize(cls_cov[tail_idx]) if len(tail_idx) else None
+    head_sum = summarize(cls_cov[head_idx]) if len(head_idx) else None
+
+    print(f"\n[{method_name}] classwise coverage split")
+    if tail_sum is not None:
+        print(f"  tail (m={len(tail_idx)}): avg={tail_sum['avg']:.4f} worst={tail_sum['worst']:.4f} std={tail_sum['std']:.4f}")
+    if head_sum is not None:
+        print(f"  head (m={len(head_idx)}): avg={head_sum['avg']:.4f} worst={head_sum['worst']:.4f} std={head_sum['std']:.4f}")
+
 #----------------------------
 # top K 출력
 #----------------------------
@@ -230,19 +434,36 @@ def eval_sets(
     y: np.ndarray,
     K: int,
     class2cluster: Optional[np.ndarray] = None,
+    tail_set: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """
-    Returns overall, classwise, and (optional) clusterwise metrics.
+    Returns overall, classwise, tail/head (optional), and (optional) clusterwise metrics.
     """
     n, K2 = S.shape
     assert K2 == K
+
+    y = np.asarray(y, dtype=int)
 
     hit = S[np.arange(n), y].astype(float)
     size_i = S.sum(axis=1).astype(float)
 
     out: Dict[str, object] = {}
-    out["coverage"] = float(hit.mean())
-    out["avg_size"] = float(size_i.mean())
+    out["coverage"] = float(np.mean(hit))
+    out["avg_size"] = float(np.mean(size_i))
+
+    # ---- tail/head (samplewise, by true label) ----
+    if tail_set is not None:
+        tail_set = np.asarray(tail_set, dtype=int)
+        is_tail = np.isin(y, tail_set)
+        is_head = ~is_tail
+
+        out["n_tail"] = int(is_tail.sum())
+        out["n_head"] = int(is_head.sum())
+
+        out["cov_tail"] = float(np.mean(hit[is_tail])) if is_tail.any() else float("nan")
+        out["cov_head"] = float(np.mean(hit[is_head])) if is_head.any() else float("nan")
+        out["size_tail"] = float(np.mean(size_i[is_tail])) if is_tail.any() else float("nan")
+        out["size_head"] = float(np.mean(size_i[is_head])) if is_head.any() else float("nan")
 
     # ---- classwise ----
     cov_k = np.full(K, np.nan, dtype=float)
@@ -253,15 +474,15 @@ def eval_sets(
         m = (y == k)
         n_k[k] = int(m.sum())
         if n_k[k] > 0:
-            cov_k[k] = float(hit[m].mean())
-            size_k[k] = float(size_i[m].mean())
+            cov_k[k] = float(np.mean(hit[m]))
+            size_k[k] = float(np.mean(size_i[m]))
 
     out["n_class"] = n_k.tolist()
     out["cov_class"] = cov_k.tolist()
     out["size_class"] = size_k.tolist()
     out["worst_class_cov"] = float(np.nanmin(cov_k))
     out["std_class_cov"] = float(np.nanstd(cov_k))
-    out['avg_class_cov'] = float(np.nanmean(cov_k))
+    out["avg_class_cov"] = float(np.nanmean(cov_k))
 
     # ---- clusterwise (if mapping provided) ----
     if class2cluster is not None:
@@ -272,22 +493,22 @@ def eval_sets(
         size_c = np.full(C, np.nan, dtype=float)
         n_c = np.zeros(C, dtype=int)
 
-        # assign each sample to cluster by its true class
         y_cluster = class2cluster[y]
 
         for c in range(C):
             m = (y_cluster == c)
             n_c[c] = int(m.sum())
             if n_c[c] > 0:
-                cov_c[c] = float(hit[m].mean())
-                size_c[c] = float(size_i[m].mean())
+                cov_c[c] = float(np.mean(hit[m]))
+                size_c[c] = float(np.mean(size_i[m]))
 
         out["n_cluster"] = n_c.tolist()
         out["cov_cluster"] = cov_c.tolist()
         out["size_cluster"] = size_c.tolist()
         out["worst_cluster_cov"] = float(np.nanmin(cov_c))
         out["std_cluster_cov"] = float(np.nanstd(cov_c))
-        out['avg_cluster_cov'] = float(np.nanmean(cov_c))
+        out["avg_cluster_cov"] = float(np.nanmean(cov_c))
+
     return out
 
 # ----------------------------
@@ -397,7 +618,29 @@ def sccp_thresholds(
     elif embed_mode == "score_quantile":
         if q_grid is None:
             q_grid = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0 - alpha]
-        emb = class_quantile_embedding(scores_sel, y_sel, K, np.array(q_grid, dtype=float))
+        q_grid_arr = np.array(q_grid, dtype=np.float64)
+
+        c_labels, C_eff, is_null = cluster_classes_cccp_style(
+            scores_sel=scores_sel,
+            y_sel=y_sel,
+            K=K,
+            q_grid=q_grid_arr,
+            alpha=alpha,
+            n_clusters=n_clusters,
+            seed=seed,
+        )
+
+        # ===== DEBUG LOG (sanity check) =====
+        n_min = min_count_for_null(alpha)
+        counts_sel = np.bincount(y_sel, minlength=K)
+        print(f"[CCCP-cluster] alpha={alpha} n_min={n_min}")
+        print(f"[CCCP-cluster] null_classes={int(is_null.sum())}/{K}")
+        null_ids = np.where(is_null)[0]
+        print(f"[CCCP-cluster] null example ids: {null_ids[:20].tolist()}")
+        print(f"[CCCP-cluster] nonnull_classes={int((~is_null).sum())}/{K}")
+        print(f"[CCCP-cluster] C_eff={C_eff} (expect null_id={C_eff-1})")
+        print(f"[CCCP-cluster] class2cluster max={int(c_labels.max())} min={int(c_labels.min())}")
+        # ==============================
 
     else:
         raise ValueError(f"Unknown embed_mode={embed_mode}")
@@ -413,9 +656,21 @@ def sccp_thresholds(
             t_class[k] = quantile_upper(scores_cal[m], alpha)
 
     # cluster thresholds
-    t_cluster = np.full(n_clusters, np.nan, dtype=np.float64)
-    n_cluster = np.zeros(n_clusters, dtype=np.int64)
-    for c in range(n_clusters):
+    if embed_mode == 'score_quantile':
+        C = C_eff
+    else:
+        C = n_clusters
+    t_cluster = np.full(C, np.nan, dtype=np.float64)
+    n_cluster = np.zeros(C, dtype=np.int64)
+
+    null_c = C - 1 if (embed_mode == 'score_quantile') else None
+    
+    for c in range(C):
+        if (null_c is not None) and (c == null_c):
+            t_cluster[c] = global_t
+            n_cluster[c] = 0
+            continue
+        
         cls_in_c = np.where(c_labels == c)[0]
         m = np.isin(y_cal, cls_in_c)
         n_cluster[c] = int(m.sum())
@@ -424,9 +679,10 @@ def sccp_thresholds(
         else:
             t_cluster[c] = global_t
 
+
     # global + cluster shrinkage (per cluster)
     t_mix_cluster = np.zeros(n_clusters, dtype=np.float64)
-    for c in range(n_clusters):
+    for c in range(C):
         tc = t_cluster[c] if np.isfinite(t_cluster[c]) else global_t
         nc = n_cluster[c]
         wc = nc / (nc + shrink_tau) if (nc + shrink_tau) > 0 else 0.0
@@ -470,15 +726,6 @@ def eval_one_method_sccp(
 # -------------------------
 def parse_float_list(s: str) -> List[float]:
     return [float(x) for x in s.split(",") if x.strip() != ""]
-
-
-def parse_int_list(s: str) -> List[int]:
-    return [int(x) for x in s.split(",") if x.strip() != ""]
-
-
-def _parse_int_list(s: str) -> List[int]:
-    return parse_int_list(s)
-
 
 @dataclass
 class Results:
@@ -541,7 +788,20 @@ def main():
 
     print("=== DEBUG: class/cluster metrics enabled ===")
     splits = load_npz_splits(args.npz, K=args.K, fallback_split_seed=args.seed)
+    # --- define tail/head classes (CIFAR-LT standard: based on train-pool counts) ---
+    z_npz = np.load(args.npz, allow_pickle=True)
 
+    if "tail_set" in z_npz.files:
+        tail_set = z_npz["tail_set"]
+    elif "counts_pool" in z_npz.files:
+        counts_pool = np.asarray(z_npz["counts_pool"], dtype=float)
+        K = args.K
+        m = int(np.ceil(0.2 * K))  # 기본 20%
+        order = np.argsort(counts_pool)  # ascending
+        tail_set = order[:m].astype(int)
+    else:
+        raise ValueError("Need tail_set or counts_pool in NPZ to define tail classes.")
+    
     P_cal, y_cal = splits["cal"]
     P_test, y_test = splits["test"]
 
@@ -563,8 +823,9 @@ def main():
         print(f"[alpha] {args.alpha}  [seed] {args.seed}  [embed] {args.embed}"
               f"{'' if q_grid is None else f'  [q_grid]={q_grid}'}")
         print("\nSweep results (SCCP only):")
-        print("Kc | tau  |   cov   |  size  | avg_clu | worst_clu | std_clu")
-        print("-------------------------------------------------------------")
+        print("Kc | tau  |  cov  | size | covT |  szT | covH |  szH | avg_clu | worst_clu | std_clu")
+        print("--------------------------------------------------------------------------------------")
+
 
         for Kc in kc_vals:
             for tau in tau_vals:
@@ -578,9 +839,25 @@ def main():
                     embed_mode=args.embed,
                     q_grid=q_grid,
                 )
-                res = eval_one_method_sccp(P_test, y_test, t_sccp, class2cluster, K=args.K)
-                print(f"{Kc:2d} | {tau:4.0f} | {res['cov']:.4f} | {res['size']:.1f} | "
-                      f"{res['avg_clu']:.4f} | {res['worst_clu']:.4f} | {res['std_clu']:.4f}")
+                S = P_test >= (1.0 - t_sccp[None, :])
+                res = eval_sets(S, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
+
+                cov  = res["coverage"]
+                size = res["avg_size"]
+
+                covT = res.get("cov_tail", float("nan"))
+                szT  = res.get("size_tail", float("nan"))
+                covH = res.get("cov_head", float("nan"))
+                szH  = res.get("size_head", float("nan"))
+
+                avg_clu   = res.get("avg_cluster_cov", float("nan"))
+                worst_clu = res.get("worst_cluster_cov", float("nan"))
+                std_clu   = res.get("std_cluster_cov", float("nan"))
+
+                print(f"{Kc:2d} | {tau:4.0f} | {cov:5.3f} | {size:4.1f} | "
+                    f"{covT:5.3f} | {szT:4.1f} | {covH:5.3f} | {szH:4.1f} | "
+                    f"{avg_clu:7.4f} | {worst_clu:9.4f} | {std_clu:7.4f}")
+
         return
 
     # ============================================================
@@ -604,7 +881,7 @@ def main():
     # --- GCP ---
     t_global = quantile_upper(score_s1(P_cal, y_cal), args.alpha)
     S_gcp = predset_from_threshold(P_test, t_global)
-    eg = eval_sets(S_gcp, y_test, K=args.K, class2cluster=class2cluster)
+    eg = eval_sets(S_gcp, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
 
     # --- CCCP (use global fallback for missing classes) ---
     scores_cal = score_s1(P_cal, y_cal)
@@ -617,29 +894,60 @@ def main():
         else:
             t_class[k] = t_global
     S_cccp = P_test >= (1.0 - t_class[None, :])
-    ec = eval_sets(S_cccp, y_test, K=args.K, class2cluster=class2cluster)
+    ec = eval_sets(S_cccp, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
 
     # --- SCCP ---
     S_sccp = P_test >= (1.0 - t_sccp[None, :])
-    es = eval_sets(S_sccp, y_test, K=args.K, class2cluster=class2cluster)
-
+    es = eval_sets(S_sccp, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
     rows = [
         Results("GCP", **pick_summary(eg)),
         Results("CCCP", **pick_summary(ec)),
         Results("SCCP", **pick_summary(es)),
     ]
 
+    def _get(e, key, default=float("nan")):
+        v = e.get(key, default)
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _row(method: str, e: dict):
+        return {
+            "method": method,
+            "cov": _get(e, "coverage"),
+            "size": _get(e, "avg_size"),
+            "covT": _get(e, "cov_tail"),
+            "szT": _get(e, "size_tail"),
+            "covH": _get(e, "cov_head"),
+            "szH": _get(e, "size_head"),
+            "avg_cls": _get(e, "avg_class_cov"),
+            "worst_cls": _get(e, "worst_class_cov"),
+            "std_cls": _get(e, "std_class_cov"),
+            "avg_clu": _get(e, "avg_cluster_cov"),
+            "worst_clu": _get(e, "worst_cluster_cov"),
+            "std_clu": _get(e, "std_cluster_cov"),
+        }
+    tab = [
+        _row("GCP", eg),
+        _row("CCCP", ec),
+        _row("SCCP", es),
+    ]
+
+
+    # --- Print results table ---
     print(f"[file] {args.npz}")
     print(f"[alpha] {args.alpha}  [clusters] {args.clusters}  [tau] {args.tau}  [seed] {args.seed}")
     print("")
-    print(f"{'method':6s} | {'cov':>7s} | {'size':>6s} |"
-          f"{'avg_cls':>7s} |  {'worst_cls':>9s} | {'std_cls':>7s} |"
-          f"{'avg_clu':>7s} |  {'worst_clu':>9s} | {'std_clu':>7s}")
-    print("-" * 102)
-    for r in rows:
-        print(f"{r.method:6s} | {r.coverage:7.4f} | {r.avg_size:6.3f} | "
-              f"{r.avg_class_cov:7.4f} | {r.worst_class_cov:9.4f} | {r.std_class_cov:7.4f} | "
-              f"{r.avg_cluster_cov:7.4f} | {r.worst_cluster_cov:9.4f} | {r.std_cluster_cov:7.4f}")
+    print("method |   cov  |  size |  covT |   szT |  covH |   szH | avg_cls | worst_cls | std_cls | avg_clu | worst_clu | std_clu")
+    print("-" * 118)
+
+    for r in tab:
+        print(f"{r['method']:6s} | {r['cov']:6.4f} | {r['size']:5.1f} | "
+            f"{r['covT']:5.3f} | {r['szT']:5.1f} | {r['covH']:5.3f} | {r['szH']:5.1f} | "
+            f"{r['avg_cls']:7.4f} | {r['worst_cls']:9.4f} | {r['std_cls']:7.4f} | "
+            f"{r['avg_clu']:7.4f} | {r['worst_clu']:9.4f} | {r['std_clu']:7.4f}")
+
 
     # --- Top-M diagnostics ---
     if args.report_topM:
