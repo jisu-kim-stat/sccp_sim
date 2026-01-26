@@ -782,6 +782,17 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default="")
 
+    # --- Tail definition controls ---
+    ap.add_argument("--tail_frac", type=float, default=0.2,
+                    help="Tail fraction for defining tail classes (bottom tail_frac by counts_pool).")
+    ap.add_argument("--tail_mode", type=str, default="npz",
+                    choices=["npz", "counts_pool", "override"],
+                    help=("How to define tail_set. "
+                          "'npz': use tail_set from NPZ if available, else counts_pool. "
+                          "'counts_pool': always use counts_pool-derived tail_set. "
+                          "'override': ignore NPZ tail_set and recompute using tail_frac from counts_pool."))
+
+
     # --- Top-M diagnostics ---
     ap.add_argument("--report_topM", action="store_true",
                     help="Print true-label rank / top-M accuracy diagnostics.")
@@ -812,16 +823,43 @@ def main():
     # --- define tail/head classes (CIFAR-LT standard: based on train-pool counts) ---
     z_npz = np.load(args.npz, allow_pickle=True)
 
-    if "tail_set" in z_npz.files:
-        tail_set = z_npz["tail_set"]
-    elif "counts_pool" in z_npz.files:
-        counts_pool = np.asarray(z_npz["counts_pool"], dtype=float)
-        K = args.K
-        m = int(np.ceil(0.2 * K))  # 기본 20%
-        order = np.argsort(counts_pool)  # ascending
-        tail_set = order[:m].astype(int)
+    # --- tail_set construction helper ---
+    def _tail_from_counts(counts_pool: np.ndarray, K: int, tail_frac: float) -> np.ndarray:
+        counts_pool = np.asarray(counts_pool, dtype=float)
+        if counts_pool.shape[0] != K:
+            raise ValueError(f"counts_pool length {counts_pool.shape[0]} != K={K}")
+        m = int(np.ceil(float(tail_frac) * K))
+        m = max(0, min(m, K))
+        order = np.argsort(counts_pool)  # ascending (smallest counts = tail)
+        return order[:m].astype(int)
+
+    K = args.K
+    has_tail = ("tail_set" in z_npz.files)
+    has_counts = ("counts_pool" in z_npz.files)
+
+    if args.tail_mode == "npz":
+        if has_tail:
+            tail_set = np.asarray(z_npz["tail_set"], dtype=int)
+        elif has_counts:
+            tail_set = _tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=args.tail_frac)
+        else:
+            raise ValueError("Need tail_set or counts_pool in NPZ to define tail classes.")
+
+    elif args.tail_mode == "counts_pool":
+        if not has_counts:
+            raise ValueError("tail_mode='counts_pool' requires counts_pool in NPZ.")
+        tail_set = _tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=args.tail_frac)
+
+    elif args.tail_mode == "override":
+        # ignore tail_set even if present; recompute from counts_pool
+        if not has_counts:
+            raise ValueError("tail_mode='override' requires counts_pool in NPZ to recompute tail_set.")
+        tail_set = _tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=args.tail_frac)
+
     else:
-        raise ValueError("Need tail_set or counts_pool in NPZ to define tail classes.")
+        raise ValueError(f"Unknown tail_mode={args.tail_mode}")
+
+    print(f"[tail] mode={args.tail_mode} tail_frac={args.tail_frac} m={len(tail_set)}")
     
     P_cal, y_cal = splits["cal"]
     P_test, y_test = splits["test"]
