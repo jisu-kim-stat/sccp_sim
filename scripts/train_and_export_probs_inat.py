@@ -92,10 +92,9 @@ def build_model(name: str, num_classes: int, finetune: str='full'):
             set_requires_grad(m, False)
             set_requires_grad(m.fc, True)
         elif finetune == 'last':
-            set_requires_grad(m.conv1, False)
-            set_requires_grad(m.bn1, False)
-            set_requires_grad(m.layer4, True)
-            set_requires_grad(m.fc, True)
+            set_requires_grad(m, False)
+            set_requires_grad(m.layer4, True)  # ★ 마지막 stage만 unfreeze
+            set_requires_grad(m.fc, True)      # ★ head unfreeze
         return m
     
     if name == 'resnet50':
@@ -106,10 +105,9 @@ def build_model(name: str, num_classes: int, finetune: str='full'):
             set_requires_grad(m, False)
             set_requires_grad(m.fc, True)
         elif finetune == 'last':
-            set_requires_grad(m.conv1, False)
-            set_requires_grad(m.bn1, False)
-            set_requires_grad(m.layer4, True)
-            set_requires_grad(m.fc, True)
+            set_requires_grad(m, False)
+            set_requires_grad(m.layer4, True)  # ★ 마지막 stage만 unfreeze
+            set_requires_grad(m.fc, True)      # ★ head unfreeze
         return m
     
     if name == 'mobilenet_v3_small':
@@ -275,7 +273,12 @@ def main():
 
     z = np.load(img_npz, allow_pickle=True)
     X_train, y_train = z["X_train"], z["y_train"]
-    X_val, y_val     = z["X_val"], z["y_val"]
+    if "X_val" in z.files and "y_val" in z.files:
+        X_val, y_val = z["X_val"], z["y_val"]
+    elif "X_calib" in z.files and "y_calib" in z.files:
+        X_val, y_val = z["X_calib"], z["y_calib"]   # treat calib as val pool for Calib-A/B/Test2 split
+    else:
+        raise KeyError("Need (X_val,y_val) or (X_calib,y_calib) in img_npz.")
     X_test, y_test   = z["X_test"], z["y_test"]
 
     K = int(max(y_train.max(), y_val.max(), y_test.max())) + 1

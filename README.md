@@ -73,11 +73,11 @@ data/npz/
 ### 실행 예시 (ResNet50, head-only)
 ```bash
 python3 scripts/train_and_export_probs_inat.py \
-  --img_npz data/npz/inat2017_images_t50k_v10k_te10k_seed1.npz \
-  --out_prob_npz data/npz/inat2017_probs_selA_calB_test_rn50_head_t50k_ep5_seed1.npz \
+  --img_npz data/npz/inat2017_images_strat_t50k_v30k_te10k_seed1.npz \
+  --out_prob_npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
   --model resnet50 \
-  --finetune head \
-  --epochs 5 \
+  --finetune head\
+  --epochs 10 \
   --batch_size 128 \
   --lr 1e-3 \
   --weight_decay 1e-4 \
@@ -85,6 +85,7 @@ python3 scripts/train_and_export_probs_inat.py \
   --seed 1 \
   --amp
 ```
+
 
 
 ### 옵션 설명
@@ -97,7 +98,7 @@ python3 scripts/train_and_export_probs_inat.py \
   - `counts_pool` : train split 기준 클래스별 샘플 수 (tail 정의용)
 
 #### 모델 및 전이학습 설정
-- `--model`  : resnet18, resnet50, 
+- `--model`  : resnet18, resnet50, mobilenet_v3_small, efficientnet_b0, convnext_tiny
 - `--finetune` : `head`는 classification head만 학습, backbone은 고정.`last` 는 마지막 stage+head만 학습,`full`은 전체 네트워크를 fine-tuning.
 
 #### 학습 하이퍼파라미터
@@ -155,8 +156,8 @@ data/npz/
 
 ### 실행 예시
 ```bash
-python3 scripts/un_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_selA_calB_test_rn50_head_t50k_ep5_seed1.npz \
+python3 scripts/run_cp_from_npz.py \
+  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
   --alpha 0.1 \
   --K 5089 \
   --clusters 10 \
