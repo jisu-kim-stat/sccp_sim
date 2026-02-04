@@ -165,7 +165,7 @@ def build_model(name: str, num_classes: int, finetune: str='full'):
 @torch.no_grad()
 def predict_proba(model, loader, device, amp: bool = True):
     model.eval()
-    Ps, Ys = [], []
+    Zs, Ps, Ys = [], [], []
 
     use_amp = amp and device.type == "cuda"
 
@@ -175,14 +175,14 @@ def predict_proba(model, loader, device, amp: bool = True):
             logits = model(x)
             p = torch.softmax(logits, dim=1)
 
+        Zs.append(logits.detach().cpu().numpy())
         Ps.append(p.detach().cpu().numpy())
         Ys.append(y.numpy())
 
-    P = np.concatenate(Ps, axis=0)
+    Z = np.concatenate(Zs, axis=0).astype(np.float32)
+    P = np.concatenate(Ps, axis=0).astype(np.float32)
     Y = np.concatenate(Ys, axis=0).astype(np.int64)
-    return P, Y
-
-
+    return Z, P, Y
 
 def train_one_epoch(model, loader, opt, device, scaler, amp: bool = True):
     model.train()
@@ -372,9 +372,9 @@ def main():
     dl_test = DataLoader(NPZImageDataset(X_test2, y_test2, train=False, seed=args.seed),
                          batch_size=args.batch_size, shuffle=False, **dl_common)
 
-    p_sel, y_sel = predict_proba(model, dl_calA, device, amp=amp)
-    p_cal, y_cal = predict_proba(model, dl_calB, device, amp=amp)
-    p_test, y_t  = predict_proba(model, dl_test,  device, amp=amp)
+    z_sel, p_sel, y_sel = predict_proba(model, dl_calA, device, amp=amp)
+    z_cal, p_cal, y_cal = predict_proba(model, dl_calB, device, amp=amp)
+    z_test, p_test, y_t  = predict_proba(model, dl_test,  device, amp=amp)
     assert np.array_equal(y_t, y_test2.astype(np.int64)), "Test labels mismatch after loader."
 
     meta = {
@@ -411,6 +411,11 @@ def main():
         p_sel=p_sel.astype(np.float32), y_sel=y_sel.astype(np.int64),
         p_cal=p_cal.astype(np.float32), y_cal=y_cal.astype(np.int64),
         p_test=p_test.astype(np.float32), y_test=y_test2.astype(np.int64),
+
+        z_sel=z_sel.astype(np.float32),
+        z_cal=z_cal.astype(np.float32),
+        z_test=z_test.astype(np.float32),
+        
         counts_pool=counts_pool,
         tail_set = tail_set,
         meta=np.array([meta], dtype=object),

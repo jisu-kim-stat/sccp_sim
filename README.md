@@ -1,13 +1,16 @@
 # Shrinkage-Class-Clustered Conformal Prediction (SCC-CP)
 본 저장소는 대규모 다중 클래스 이미지 분류 문제에서 **Global CP / Class-Conditional CP / Shrinkage Class-Clustered CP (SCCP)** 방법을 비교하기 위한 실험 코드 모음이다.
 
-주요 실험 데이터셋은 **iNat2017**이며, 추가적으로 **CIFAR100** 데이터셋에 대해서도 실험하였다. 
+주요 실험 데이터셋은 다음과 같다.
+- iNaturalist (inat2017) 
+- CIFAR100 (cifar100)
+- SDSS (Photometric Redshift) 
 
 ---
 
 ## 전체 파이프라인 요약
 
-1. iNat2017 이미지 데이터 → NPZ 변환  
+1. 이미지 데이터 → NPZ 변환  
 2. 이미지 분류 모델 학습 및 **확률 출력 NPZ 생성**  
 3. 확률 NPZ를 입력으로 conformal prediction 수행  
 4. GCP / CCCP / SCCP 성능 비교 (coverage, set size 등)
@@ -42,28 +45,38 @@ iNat2017은 실제 자연 환경에서 수집된 대규모 이미지 분류 데�
 
 
 ## 2. iNat2017 데이터를 NPZ로 변환
-원본 파일은 용량 문제로 직접 사용하지 않으며, 실험에 필요한 train/val/test split을 포함한 NPZ 파일로 변환하여 사용한다.
+원본 파일은 용량 문제로 직접 사용하지 않으며, 실험에 필요한 train/val/test split을 포함한 NPZ 파일로 변환하여 사용한다. 
 
 ### 실행 예시
 ```bash
-python scripts/make_npz_inat2017_tfds_tfhub.py \
-  --out_npz data/npz/inat2017_images_t50k_v10k_te10k_seed1.npz \
+python3 make_inat_image_stratified_family.py \
+  --inat_root "data/inat2017_raw" \
+  --train_json "data/inat2017_raw/train2017.json" \
+  --val_json   "data/inat2017_raw/val2017.json" \
+  --cat_to_family_json "data/inat2017_meta_family/category_to_family.json" \
+  --out_npz "data/npz/inat2017_images_family_strat_t50k_c30k_te10k_seed1.npz" \
   --seed 1 \
-  --n_sel 50000 \
-  --n_cal 10000 \
-  --n_test 10000
+  --image_size 224 \
+  --n_train 50000 \
+  --n_calib 30000 \
+  --n_test 10000 \
+  --min_family_count 250 \
+  --min_test_per_family 1 \
+  --min_calib_per_family 1 \
+  --save_indices
 ```
 
 ### 생성 파일
-```bash
-data/npz/
-└── inat2017_images_t50k_v10k_te10k_seed1.npz
-```
+iNaturalist 2017 데이터로부터 family-level label 기준의 stratified split을 생성한다. 생성 파일은 다음을 포함한다.
+- `X_train`, `X_cal`, `X_test` : 이미지 데이터
+- `y_train`, `y_cal`, `y_test` : 정답 레이블
+- `idx_train`, `idx_calib`, `idx_test` (Optional) : 전체 pool 기준 인덱스
+- `meta` : family 매핑 정보 및 데이터 생성 설덩
 
-해당 NPZ에는 다음의 정보가 포함된다 : 
-- 이미지 배열
-- 정답 레이블
-- selection / calibration / test index
+### 참고
+- `--min_family_count` 보다 수가 적은 family는 사전에 제거됨.
+- 모든 split은 family 분포를 유지하도록 stratified sampling됨.
+
 
 ---
 
@@ -86,41 +99,10 @@ python3 scripts/train_and_export_probs_inat.py \
 ```
 
 
-
-### 옵션 설명
-#### 입/출력 관련
-- `--img_npz` : iNat2017 원본 이미지를 전처리하여 저장한 이미지 NPZ 파일 경로.
-- `--out_prob_npz` : 학습된 모델로부터 얻은 class probability 결과를 저장할 NPZ 파일 경로. 생성되는 파일에는 다음 항목들이 포함된다. 
-  -  `p_sel, y_sel` : selection set 확률 및 레이블
-  -  `p_cal, y_cal` : calibration set 확률 및 레이블
-  - `p_test, y_test` : test set 확률 및 레이블
-  - `counts_pool` : train split 기준 클래스별 샘플 수 (tail 정의용)
-
-#### 모델 및 전이학습 설정
-- `--model`  : resnet18, resnet50, mobilenet_v3_small, efficientnet_b0, convnext_tiny
-- `--finetune` : `head`는 classification head만 학습, backbone은 고정.`last` 는 마지막 stage+head만 학습,`full`은 전체 네트워크를 fine-tuning.
-
-#### 학습 하이퍼파라미터
-- `--epochs` : 학습 에폭 수
-- `--batch_size` : 미니배치 크기. GPU에 맞게 조절 가능.
-- `--lr` : 학습률
-- `--weight_decay` : L2 정규화 계수. overfitting 방지 위해 사용.
-
-##### Calibration Split
-- `--calibA_frac` : validation set을 Calib-A / Calib-B / Test2로 나눌 때, Calib-A가 차지하는 비율.
-  - Calib-A: selection set (clustering / embedding용)
-  - Calib-B: calibration set (threshold 추정용)
-- `--calib_split_seed` : validation set 분할에 사용되는 random seed.
-동일 seed 사용 시 실험 재현 가능.
-
-##### 재현성 및 연산 옵션
-- `--seed` : 모델 초기화 및 데이터 로딩에 사용되는 random seed.
-- `--amp` : Automatic Mixed Precision (FP16) 사용. GPU 메모리 사용량을 줄이고 학습 속도를 향상시킨다. (모델 출력 확률에는 영향을 주지 않음)
-
 ### 출력 파일
 ```bash
 data/npz/
-└── inat2017_probs_selA_calB_test_rn50_head_t50k_ep5_seed1.npz
+└── inat2017_probs_selA_calB_test_rn50_head_t50k_ep10_seed1.npz
 ```
 이 확률 NPZ 파일은 이후의 Conformal Prediction 방법들의 input으로 사용된다. 
 
@@ -155,58 +137,65 @@ data/npz/
 
 ### 실행 예시
 ```bash
-python3 scripts/run_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep20_seed1.npz \
-  --alpha 0.1 \
-  --K 5089 \
-  --clusters 10 \
-  --tau 30 \
-  --embed score_quantile \
-  --q_grid 0.5,0.6,0.7,0.8,0.9 \
-  --seed 1
+# (1) Softmax score로 CP 수행 + SCCP 클러스터링은 logit 기반 임베딩 사용
+python scripts/run_cp_from_npz.py \
+  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
+  --K 5089 --alpha 0.1 --seed 1 \
+  --score softmax \
+  --emb_source logit \
+  --weighted_kmeans \
+  --clusters 10 --tau 50 --beta 0.5 \
+  --tail_mode npz --tail_frac 0.2
 ```
--  `npz` : 확률 예측값과 sel/cal/test split이 저장된 파일 경로
-- `K` : 전체 클래스 수. (inat2017의 경우 `5089`)
--  `clusters ` : 클러스터 개수 
-- `alpha` : 목표 miscoverage 수준
--  `tau` : shrinkage parameter
-- `embed` : class embedding method
-  - `score_quantile` : 클래스별 score 분포의 quantile 기반 임베딩 (default)
-  - `prob_mean` : 평균 확률 벡터 기반 임베딩 
-- `q_grid` : `score_quantile` 에서 사용하는 quantile grid
-
-
-### (Note) Running iNat2017 training safely 
-서버에 CUDA/cuDNN이 여러 버전 설치되어 있어 fine-tuning에서 오류가 발생하는 경우, 다음 스크립트를 통해 실행
 ```bash
-chmod +x run_inat_full.sh
-./run_inat_full.sh
+# (2) 위와 동일 + CCCP(Ding) 결과도 같이 출력
+python scripts/run_cp_from_npz.py \
+  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
+  --K 5089 --alpha 0.1 --seed 1 \
+  --score softmax \
+  --emb_source logit \
+  --weighted_kmeans \
+  --clusters 10 --tau 50 --beta 0.5 \
+  --tail_mode npz --tail_frac 0.2 \
+  --run_cccp \
+  --cccp_gamma 0.5 --cccp_M 10
 ```
+```bash
+# (3) APS / RAPS도 같은 설정으로 비교 (score만 바꿔서 반복)
+python scripts/run_cp_from_npz.py \
+  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
+  --K 5089 --alpha 0.1 --seed 1 \
+  --score aps \
+  --emb_source logit \
+  --weighted_kmeans \
+  --clusters 10 --tau 50 --beta 0.5 \
+  --tail_mode npz --tail_frac 0.2
 
+python scripts/run_cp_from_npz.py \
+  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
+  --K 5089 --alpha 0.1 --seed 1 \
+  --score raps --raps_lambda 0.05 --raps_kreg 5 \
+  --emb_source logit \
+  --weighted_kmeans \
+  --clusters 10 --tau 50 --beta 0.5 \
+  --tail_mode npz --tail_frac 0.2
+```
+#### Option
+- `--score softmax|aps|raps` : 예측집합을 만드는 CP score
+- `--emb_source logit` : SCCP에서 클래스 클러스터링 임베딩만 logit 기반으로 생성
+- `--weighted_kmeans` : 클래스별 표본수에 비례한 가중치로 K-means
+- `--clusters Kc, --tau, --beta` : SCCP 하이퍼파라미터
 ---
 
 ## 6. 출력 및 평가 지표
 기본 출력 지표는 다음과 같다. 
-- Overall coverage
-- Average prediction set size
-- Classwise coverage
-- Clusterwise coverage
-- Shrinkage parameter distribution(`lambda_hat`)
-
-예시 출력 : 
-```bash
-Overall coverage: 0.901
-Avg set size: 512.4
-Mean lambda: 0.38
-```
-
+- Marginal coverage
+- Average set size
+- Coverage gap
+- Tail/Head coverage
+- Tail/Head set size
 ---
 
-## 8. TODO_0114
-
-- CIFAR / iNat README 분리
-- 실험 결과 테이블 자동 생성
-- clusterwise 결과 시각화 스크립트 정리
 
 
 # References

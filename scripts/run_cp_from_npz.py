@@ -1,191 +1,34 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import argparse
-import numpy as np
+import json
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
-#----------------------------
-# CCCP Utilities #
-#----------------------------
 import numpy as np
-from typing import Optional, Tuple
+from collections import Counter
 
-def min_count_for_null(alpha: float) -> int:
-    """
-    CCCP-style null-cluster criterion:
-      if n_y < (1 / min(alpha, 0.1)) - 1  => null cluster
-    """
-    thr = (1.0 / min(alpha, 0.1)) - 1.0
-    # "보다 작으면" 이므로 정수화는 floor 성격이 자연스러움
-    return int(np.floor(thr))
+try:
+    from sklearn.cluster import KMeans
+except Exception:
+    KMeans = None
 
-def weighted_kmeans_simple(
-    X: np.ndarray,
-    n_clusters: int,
-    weights: np.ndarray,
-    seed: int = 1,
-    n_iter: int = 50,
-) -> np.ndarray:
-    """
-    Minimal weighted k-means:
-      - assignment: Euclidean distance
-      - update: weighted mean with weights
-    """
-    rng = np.random.default_rng(seed)
-    N, d = X.shape
-    w = np.asarray(weights, dtype=float)
-    w = np.clip(w, 0.0, None)
 
-    # init centers: sample points proportional to weights (fallback to uniform)
-    if w.sum() > 0:
-        p = w / w.sum()
-        init_idx = rng.choice(N, size=n_clusters, replace=False, p=p)
-    else:
-        init_idx = rng.choice(N, size=n_clusters, replace=False)
+# ============================================================
+# NPZ loading utilities (sel / cal / test) + optional logits
+# ============================================================
 
-    centers = X[init_idx].copy()
-    labels = np.zeros(N, dtype=int)
-
-    for _ in range(n_iter):
-        # assign
-        d2 = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        new_labels = d2.argmin(axis=1)
-        if np.all(new_labels == labels):
-            break
-        labels = new_labels
-
-        # update (weighted mean)
-        for c in range(n_clusters):
-            m = (labels == c)
-            if not m.any():
-                # re-init empty cluster
-                if w.sum() > 0:
-                    idx = rng.choice(N, p=w / w.sum())
-                else:
-                    idx = rng.integers(0, N)
-                centers[c] = X[idx]
-                continue
-
-            wm = w[m]
-            if wm.sum() <= 0:
-                centers[c] = X[m].mean(axis=0)
-            else:
-                centers[c] = (X[m] * wm[:, None]).sum(axis=0) / wm.sum()
-
-    return labels
-
-def class_quantile_embedding_with_null(
-    scores_sel: np.ndarray,
-    y_sel: np.ndarray,
-    K: int,
-    q_grid: np.ndarray,
-    alpha: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns:
-      emb: (K, d) quantile embedding (global quantiles used as filler for non-null only if needed)
-      n_y: (K,) counts in sel
-      is_null: (K,) boolean indicating null-cluster classes
-    """
-    q_grid = np.asarray(q_grid, dtype=float)
-    d = len(q_grid)
-
-    y_sel = np.asarray(y_sel, dtype=int)
-    scores_sel = np.asarray(scores_sel, dtype=float)
-
-    n_y = np.bincount(y_sel, minlength=K)
-    n_min = min_count_for_null(alpha)
-    is_null = n_y < n_min  # strict "<" as you specified
-
-    # global quantiles (for numerical safety / fallback)
-    global_q = np.quantile(scores_sel, q_grid, method="higher")
-
-    emb = np.zeros((K, d), dtype=float)
-    for k in range(K):
-        mk = (y_sel == k)
-        if mk.any() and (not is_null[k]):
-            emb[k] = np.quantile(scores_sel[mk], q_grid, method="higher")
-        else:
-            # null classes: embedding value won't be used in clustering
-            # but fill with global_q to avoid NaNs
-            emb[k] = global_q
-
-    # numerical safety
-    bad = ~np.isfinite(emb)
-    if bad.any():
-        emb[bad] = np.take(global_q, np.where(bad)[1])
-
-    return emb, n_y.astype(int), is_null
-
-def cluster_classes_cccp_style(
-    scores_sel: np.ndarray,
-    y_sel: np.ndarray,
-    K: int,
-    q_grid: np.ndarray,
-    alpha: float,
-    n_clusters: int,
-    seed: int,
-) -> Tuple[np.ndarray, int, np.ndarray]:
-    """
-    CCCP-style clustering:
-      1) null cluster assignment by n_y < (1/min(alpha,0.1))-1
-      2) run weighted k-means on remaining classes with weight sqrt(n_y)
-      3) return class2cluster where null classes map to an extra cluster index (n_clusters)
-    
-    Returns:
-      class2cluster: (K,) in {0,...,n_clusters}  (last id = null cluster)
-      C_eff: n_clusters + 1
-      is_null: (K,)
-    """
-    emb, n_y, is_null = class_quantile_embedding_with_null(
-        scores_sel=scores_sel,
-        y_sel=y_sel,
-        K=K,
-        q_grid=q_grid,
-        alpha=alpha,
-    )
-
-    idx_nonnull = np.where(~is_null)[0]
-    idx_null = np.where(is_null)[0]
-
-    # If all are null (extreme case), everything goes to null cluster
-    if len(idx_nonnull) == 0:
-        class2cluster = np.full(K, n_clusters, dtype=int)
-        return class2cluster, n_clusters + 1, is_null
-
-    X = emb[idx_nonnull]
-    w = np.sqrt(np.maximum(n_y[idx_nonnull], 0)).astype(float)
-
-    # If fewer non-null classes than clusters, reduce clusters
-    Kc = min(n_clusters, len(idx_nonnull))
-    labels_nonnull = weighted_kmeans_simple(X, n_clusters=Kc, weights=w, seed=seed)
-
-    # Map back to full K, and reserve last cluster id = null cluster
-    class2cluster = np.full(K, n_clusters, dtype=int)  # default null cluster id
-    class2cluster[idx_nonnull] = labels_nonnull
-
-    # Effective cluster count:
-    # - non-null clusters: 0..Kc-1
-    # - (optional) unused cluster ids if Kc<n_clusters are fine but we will compress to Kc
-    # - null cluster id: Kc
-    # To keep things clean, compress cluster ids to 0..Kc-1 then null=Kc
-    # (This avoids "max cluster id" mismatches later.)
-    # relabel non-null cluster ids to 0..Kc-1 already; set null to Kc
-    class2cluster[idx_null] = Kc
-    C_eff = Kc + 1
-
-    return class2cluster, C_eff, is_null
-
-# ----------------------------
-# Utilities: load & auto-detect arrays
-# ----------------------------
 def _is_prob_matrix(a: np.ndarray, K: int) -> bool:
     return isinstance(a, np.ndarray) and a.ndim == 2 and a.shape[1] == K and np.isfinite(a).all()
 
 def _is_label_vector(a: np.ndarray) -> bool:
     return isinstance(a, np.ndarray) and a.ndim == 1 and np.issubdtype(a.dtype, np.integer)
 
+def _is_logit_matrix(a: np.ndarray, K: int) -> bool:
+    return isinstance(a, np.ndarray) and a.ndim == 2 and a.shape[1] == K and np.isfinite(a).all()
+
 def _normalize_rows(P: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    # Ensure row sums are 1 (robust to minor drift)
     s = P.sum(axis=1, keepdims=True)
     s = np.where(s <= eps, 1.0, s)
     Pn = P / s
@@ -193,13 +36,14 @@ def _normalize_rows(P: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     Pn = Pn / Pn.sum(axis=1, keepdims=True)
     return Pn
 
-def _find_by_name(d: Dict[str, np.ndarray], include: Tuple[str, ...], K: int) -> Optional[np.ndarray]:
-    # find prob matrices by substring in key name
+def _find_by_name(d: Dict[str, np.ndarray], include: Tuple[str, ...], K: int, kind: str = "prob") -> Optional[np.ndarray]:
     for k in d.keys():
         lk = k.lower()
         if all(s in lk for s in include):
             a = d[k]
-            if _is_prob_matrix(a, K):
+            if kind == "prob" and _is_prob_matrix(a, K):
+                return a
+            if kind == "logit" and _is_logit_matrix(a, K):
                 return a
     return None
 
@@ -212,14 +56,12 @@ def _find_label_by_name(d: Dict[str, np.ndarray], include: Tuple[str, ...]) -> O
                 return a
     return None
 
-def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-    """
-    Returns dict with keys among {'sel','cal','test'} mapping to (P, y).
-    Auto-detect common key patterns; fallback if test missing.
-    """
+def load_npz_splits(
+    path: str, K: int, fallback_split_seed: int = 1
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     raw = np.load(path, allow_pickle=True)
     d = {k: raw[k] for k in raw.files}
-        # ---- Common patterns (SAFE: no `or` on numpy arrays) ----
+
     def _pick_first_nonnull(items):
         for x in items:
             if x is not None:
@@ -227,9 +69,9 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
         return None
 
     P_sel = _pick_first_nonnull([
-        _find_by_name(d, ("p", "sel"), K),
-        _find_by_name(d, ("prob", "sel"), K),
-        _find_by_name(d, ("probs", "sel"), K),
+        _find_by_name(d, ("p", "sel"), K, "prob"),
+        _find_by_name(d, ("prob", "sel"), K, "prob"),
+        _find_by_name(d, ("probs", "sel"), K, "prob"),
     ])
     y_sel = _pick_first_nonnull([
         _find_label_by_name(d, ("y", "sel")),
@@ -238,9 +80,9 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
     ])
 
     P_cal = _pick_first_nonnull([
-        _find_by_name(d, ("p", "cal"), K),
-        _find_by_name(d, ("prob", "cal"), K),
-        _find_by_name(d, ("probs", "cal"), K),
+        _find_by_name(d, ("p", "cal"), K, "prob"),
+        _find_by_name(d, ("prob", "cal"), K, "prob"),
+        _find_by_name(d, ("probs", "cal"), K, "prob"),
     ])
     y_cal = _pick_first_nonnull([
         _find_label_by_name(d, ("y", "cal")),
@@ -249,12 +91,12 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
     ])
 
     P_test = _pick_first_nonnull([
-        _find_by_name(d, ("p", "test"), K),
-        _find_by_name(d, ("prob", "test"), K),
-        _find_by_name(d, ("probs", "test"), K),
-        _find_by_name(d, ("p", "val"), K),
-        _find_by_name(d, ("prob", "val"), K),
-        _find_by_name(d, ("probs", "val"), K),
+        _find_by_name(d, ("p", "test"), K, "prob"),
+        _find_by_name(d, ("prob", "test"), K, "prob"),
+        _find_by_name(d, ("probs", "test"), K, "prob"),
+        _find_by_name(d, ("p", "val"), K, "prob"),
+        _find_by_name(d, ("prob", "val"), K, "prob"),
+        _find_by_name(d, ("probs", "val"), K, "prob"),
     ])
     y_test = _pick_first_nonnull([
         _find_label_by_name(d, ("y", "test")),
@@ -265,8 +107,7 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
         _find_label_by_name(d, ("labels", "val")),
     ])
 
-    # If not found by name, try heuristic pairing:
-    # Collect all prob matrices and label vectors; match by length.
+    # fallback: length matching
     prob_keys = [k for k, v in d.items() if _is_prob_matrix(v, K)]
     lab_keys = [k for k, v in d.items() if _is_label_vector(v)]
     probs = {k: d[k] for k in prob_keys}
@@ -277,59 +118,45 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
             return None
         if ycand is not None and len(ycand) == Pcand.shape[0]:
             return Pcand, ycand
-        # try find any label with same length
         for _, yv in labs.items():
             if len(yv) == Pcand.shape[0]:
                 return Pcand, yv
         return None
 
     splits: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-    m = match_prob_label(P_sel, y_sel)
-    if m is not None:
-        splits["sel"] = m
-    m = match_prob_label(P_cal, y_cal)
-    if m is not None:
-        splits["cal"] = m
-    m = match_prob_label(P_test, y_test)
-    if m is not None:
-        splits["test"] = m
+    for tag, Pc, yc in [("sel", P_sel, y_sel), ("cal", P_cal, y_cal), ("test", P_test, y_test)]:
+        m = match_prob_label(Pc, yc)
+        if m is not None:
+            splits[tag] = m
 
-    # If still missing, attempt to assign largest as train (ignore), next as cal/test:
     if "cal" not in splits:
-        # choose a prob matrix that has a matching label and is not the same object as sel/test
         candidates = []
-        for pk, Pv in probs.items():
+        for _, Pv in probs.items():
             my = None
-            for yk, yv in labs.items():
+            for _, yv in labs.items():
                 if len(yv) == Pv.shape[0]:
                     my = yv
                     break
             if my is not None:
-                candidates.append((pk, Pv, my))
-        # sort by n desc
-        candidates.sort(key=lambda t: t[1].shape[0], reverse=True)
-        # heuristic: if we have 3 sets, biggest=train, then cal, then test
-        if len(candidates) >= 2:
-            # take second as cal
-            splits["cal"] = (candidates[1][1], candidates[1][2])
-        elif len(candidates) == 1:
-            splits["cal"] = (candidates[0][1], candidates[0][2])
+                candidates.append((Pv, my))
+        candidates.sort(key=lambda t: t[0].shape[0], reverse=True)
+        if len(candidates) == 0:
+            raise RuntimeError("Could not find any probs+labels pair in NPZ.")
+        splits["cal"] = candidates[min(1, len(candidates) - 1)]
 
     if "test" not in splits:
-        # fallback: split cal into cal/test halves
-        if "cal" not in splits:
-            raise RuntimeError("Could not find calibration split in npz. Need at least one probs+labels pair.")
         P, y = splits["cal"]
         rng = np.random.default_rng(fallback_split_seed)
-        n = P.shape[0]
-        idx = rng.permutation(n)
-        n_cal = n // 2
-        cal_idx = idx[:n_cal]
-        test_idx = idx[n_cal:]
+        idx = rng.permutation(P.shape[0])
+        n_cal = P.shape[0] // 2
+        cal_idx, test_idx = idx[:n_cal], idx[n_cal:]
         splits["cal"] = (P[cal_idx], y[cal_idx])
         splits["test"] = (P[test_idx], y[test_idx])
 
-    # Normalize probabilities
+    if "sel" not in splits:
+        splits["sel"] = splits["cal"]
+
+    # normalize
     for k in list(splits.keys()):
         P, y = splits[k]
         P = _normalize_rows(P.astype(np.float64))
@@ -338,734 +165,709 @@ def load_npz_splits(path: str, K: int = 100, fallback_split_seed: int = 1) -> Di
 
     return splits
 
-# ----------------------------
-# Utilities : tail/head index metrics
-# ----------------------------
+from typing import Dict, Optional, Tuple
 import numpy as np
 
-def split_tail_head(K: int, tail_set: np.ndarray):
-    tail_set = np.asarray(tail_set, dtype=int)
-    tail_mask = np.zeros(K, dtype=bool)
-    tail_mask[tail_set] = True
-    head_mask = ~tail_mask
-    tail_idx = np.where(tail_mask)[0]
-    head_idx = np.where(head_mask)[0]
-    return tail_idx, head_idx
+def load_npz_logits(path: str, K: int) -> Dict[str, np.ndarray]:
+    raw = np.load(path, allow_pickle=True)
+    d = {k: raw[k] for k in raw.files}
 
-def summarize(arr: np.ndarray):
-    arr = np.asarray(arr, dtype=float)
-    return {
-        "avg": float(np.nanmean(arr)),
-        "worst": float(np.nanmin(arr)),
-        "std": float(np.nanstd(arr)),
-    }
+    def pick(tag: str) -> np.ndarray:
+        cand_list = [
+            _find_by_name(d, ("z", tag), K, kind="logit"),        # z_sel, z_cal, z_test
+            _find_by_name(d, ("logit", tag), K, kind="logit"),    
+            _find_by_name(d, ("zlogit", tag), K, kind="logit"),
+        ]
+        for x in cand_list:
+            if x is not None:
+                return x.astype(np.float64)
+        raise RuntimeError(f"Could not find logits for tag='{tag}' in NPZ. keys={list(d.keys())}")
 
-def report_tail_head(method_name: str, cls_cov: np.ndarray, tail_idx: np.ndarray, head_idx: np.ndarray):
-    tail_sum = summarize(cls_cov[tail_idx]) if len(tail_idx) else None
-    head_sum = summarize(cls_cov[head_idx]) if len(head_idx) else None
+    return {"sel": pick("sel"), "cal": pick("cal"), "test": pick("test")}
 
-    print(f"\n[{method_name}] classwise coverage split")
-    if tail_sum is not None:
-        print(f"  tail (m={len(tail_idx)}): avg={tail_sum['avg']:.4f} worst={tail_sum['worst']:.4f} std={tail_sum['std']:.4f}")
-    if head_sum is not None:
-        print(f"  head (m={len(head_idx)}): avg={head_sum['avg']:.4f} worst={head_sum['worst']:.4f} std={head_sum['std']:.4f}")
 
-#----------------------------
-# top K 출력
-#----------------------------
+# ============================================================
+# Tail / head helper
+# ============================================================
 
-def true_label_rank(P: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """
-    rank_true[i] = 1 means true label is top-1 for sample i.
-    """
-    P = np.asarray(P)
-    y = np.asarray(y).astype(int)
-    order = np.argsort(-P, axis=1)  # descending
-    pos = (order == y[:, None]).argmax(axis=1)
-    return pos + 1
+def tail_from_counts(counts_pool: np.ndarray, K: int, tail_frac: float) -> np.ndarray:
+    counts_pool = np.asarray(counts_pool, dtype=float)
+    if counts_pool.shape[0] != K:
+        raise ValueError(f"counts_pool length {counts_pool.shape[0]} != K={K}")
+    m = int(np.ceil(float(tail_frac) * K))
+    m = max(0, min(m, K))
+    order = np.argsort(counts_pool)  # ascending
+    return order[:m].astype(int)
 
-def summarize_topM(P: np.ndarray, y: np.ndarray, Ms=(1, 5, 10, 20, 50, 100, 200, 500, 1000)) -> dict:
-    r = true_label_rank(P, y)
-    out = {}
-    out["n"] = int(len(r))
-    out["rank_mean"] = float(np.mean(r))
-    out["rank_quantiles"] = {
-        "q50": float(np.quantile(r, 0.50)),
-        "q90": float(np.quantile(r, 0.90)),
-        "q95": float(np.quantile(r, 0.95)),
-        "q99": float(np.quantile(r, 0.99)),
-    }
-    out["topM_acc"] = {int(M): float(np.mean(r <= M)) for M in Ms}
-    return out
+def build_tail_set_from_npz(z_npz: np.lib.npyio.NpzFile, K: int, tail_frac: float, tail_mode: str) -> np.ndarray:
+    has_tail = ("tail_set" in z_npz.files)
+    has_counts = ("counts_pool" in z_npz.files)
 
-def _parse_int_list(s: str) -> list:
-    # e.g. "1,5,10,50,100"
-    xs = []
-    for t in s.split(","):
-        t = t.strip()
-        if t:
-            xs.append(int(t))
-    xs = sorted(set(xs))
-    return xs
+    if tail_mode == "npz":
+        if has_tail:
+            return np.asarray(z_npz["tail_set"], dtype=int)
+        if has_counts:
+            return tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=tail_frac)
+        raise ValueError("Need tail_set or counts_pool in NPZ.")
 
-# ----------------------------
-# Conformal methods
-# ----------------------------
-def score_s1(P: np.ndarray, y: np.ndarray) -> np.ndarray:
-    # Nonconformity score: s = 1 - p_true (smaller is better)
-    return 1.0 - P[np.arange(P.shape[0]), y]
+    if tail_mode == "counts_pool":
+        if not has_counts:
+            raise ValueError("tail_mode='counts_pool' requires counts_pool in NPZ.")
+        return tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=tail_frac)
 
-def quantile_upper(scores: np.ndarray, alpha: float) -> float:
-    # For split conformal classification with score s, threshold is (1-alpha)-quantile.
-    # Use conservative quantile: ceil((n+1)*(1-alpha))/n style.
+    if tail_mode == "override":
+        if not has_counts:
+            raise ValueError("tail_mode='override' requires counts_pool in NPZ.")
+        return tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=tail_frac)
+
+    raise ValueError(f"Unknown tail_mode={tail_mode}")
+
+
+# ============================================================
+# Scores (softmax / APS / RAPS)
+# ============================================================
+
+def scores_all_softmax(P: np.ndarray) -> np.ndarray:
+    return 1.0 - P
+
+def scores_all_APS(P: np.ndarray, randomize: bool = True, seed: int = 0) -> np.ndarray:
+    P = np.asarray(P, dtype=np.float64)
+    n, K = P.shape
+
+    order = np.argsort(-P, axis=1)
+    P_sorted = np.take_along_axis(P, order, axis=1)
+    cumsum = np.cumsum(P_sorted, axis=1)
+
+    inv = np.empty_like(order)
+    inv[np.arange(n)[:, None], order] = np.arange(K)[None, :]
+    cum_at_label = cumsum[np.arange(n)[:, None], inv]
+
+    if not randomize:
+        return cum_at_label - P
+    rng = np.random.default_rng(seed)
+    U = rng.random(size=P.shape)
+    return cum_at_label - U * P
+
+def scores_all_RAPS(P: np.ndarray, lmbda: float, kreg: int, randomize: bool = True, seed: int = 0) -> np.ndarray:
+    P = np.asarray(P, dtype=np.float64)
+    n, K = P.shape
+
+    order = np.argsort(-P, axis=1)
+    P_sorted = np.take_along_axis(P, order, axis=1)
+    cumsum = np.cumsum(P_sorted, axis=1)
+
+    inv = np.empty_like(order)
+    inv[np.arange(n)[:, None], order] = np.arange(K)[None, :]
+    cum_at_label = cumsum[np.arange(n)[:, None], inv]
+
+    rank = inv + 1
+    reg = np.maximum(lmbda * (rank - int(kreg)), 0.0)
+    base = cum_at_label + reg
+
+    if not randomize:
+        return base - P
+    rng = np.random.default_rng(seed)
+    U = rng.random(size=P.shape)
+    return base - U * P
+
+def get_scores_all(P: np.ndarray, score: str, seed: int, raps_lambda: float, raps_kreg: int, randomize: bool) -> np.ndarray:
+    score = score.lower()
+    if score == "softmax":
+        return scores_all_softmax(P)
+    if score == "aps":
+        return scores_all_APS(P, randomize=randomize, seed=seed)
+    if score == "raps":
+        return scores_all_RAPS(P, lmbda=raps_lambda, kreg=raps_kreg, randomize=randomize, seed=seed)
+    raise ValueError(f"Unknown score='{score}' (choose softmax/aps/raps)")
+
+
+# ============================================================
+# Conformal quantile utilities
+# ============================================================
+
+def quantile_upper_conservative(scores: np.ndarray, alpha: float) -> float:
+    scores = np.asarray(scores, dtype=float)
     n = len(scores)
     if n == 0:
-        return 1.0
+        return float(np.inf)
     k = int(np.ceil((n + 1) * (1.0 - alpha))) - 1
     k = min(max(k, 0), n - 1)
     return float(np.sort(scores)[k])
 
-def predset_from_threshold(P: np.ndarray, t: float) -> np.ndarray:
-    # include label j if 1 - P_ij <= t  <=>  P_ij >= 1 - t
-    return P >= (1.0 - t)
 
-def eval_sets(
-    S: np.ndarray,
+# ============================================================
+# CCCP
+# ============================================================
+
+def get_quantile_threshold(alpha: float) -> int:
+    n = 1
+    while np.ceil((n + 1) * (1 - alpha) / n) > 1:
+        n += 1
+    return n
+
+def get_conformal_quantile_ding(scores_true: np.ndarray, alpha: float, default_qhat: float = np.inf) -> float:
+    scores_true = np.asarray(scores_true, dtype=float)
+    n = len(scores_true)
+    if n == 0:
+        return float(default_qhat)
+    val = np.ceil((n + 1) * (1 - alpha)) / n
+    if val > 1:
+        return float(default_qhat)
+    return float(np.quantile(scores_true, val, method="inverted_cdf"))
+
+def embed_all_classes_ding(scores_true: np.ndarray, labels: np.ndarray, K: int, q=(0.5, 0.6, 0.7, 0.8, 0.9)) -> Tuple[np.ndarray, np.ndarray]:
+    scores_true = np.asarray(scores_true, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    q = np.asarray(q, dtype=float)
+
+    emb = np.zeros((K, len(q)), dtype=float)
+    cts = np.zeros((K,), dtype=float)
+
+    for k in range(K):
+        sk = scores_true[labels == k]
+        cts[k] = sk.shape[0]
+        if sk.shape[0] == 0:
+            emb[k] = np.nan
+        else:
+            emb[k] = np.quantile(sk, q, method="inverted_cdf")
+
+    if np.any(~np.isfinite(emb)):
+        g = np.quantile(scores_true, q, method="inverted_cdf") if len(scores_true) else np.zeros(len(q))
+        bad = ~np.isfinite(emb)
+        emb[bad] = np.take(g, np.where(bad)[1])
+
+    return emb, cts
+
+def cccp_thresholds_ding(
+    scores_all_totalcal: np.ndarray,
+    y_totalcal: np.ndarray,
+    alpha: float,
+    frac_clustering: float,
+    num_clusters: int,
+    seed: int,
+    embed_q=(0.5, 0.6, 0.7, 0.8, 0.9),
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    rng = np.random.default_rng(seed)
+
+    scores_all_totalcal = np.asarray(scores_all_totalcal, dtype=float)
+    y_totalcal = np.asarray(y_totalcal, dtype=int)
+    n, K = scores_all_totalcal.shape
+
+    scores_true = scores_all_totalcal[np.arange(n), y_totalcal]
+
+    idx1 = rng.random(n) < float(frac_clustering)
+    scores1, labels1 = scores_true[idx1], y_totalcal[idx1]
+    scores2, labels2 = scores_true[~idx1], y_totalcal[~idx1]
+    if len(labels2) == 0:
+        scores2, labels2 = scores_true, y_totalcal
+
+    thresh = get_quantile_threshold(alpha)
+    cts1 = Counter(labels1.tolist())
+    rare_classes = np.array([k for k in range(K) if cts1.get(k, 0) < thresh], dtype=int)
+    nonrare = np.setdiff1d(np.arange(K), rare_classes)
+
+    class2cluster = -np.ones((K,), dtype=int)
+
+    clustering_done = False
+    if (KMeans is not None) and (len(nonrare) > max(int(num_clusters), 1)) and (int(num_clusters) > 1):
+        emb, cts = embed_all_classes_ding(scores1, labels1, K=K, q=embed_q)
+        X = emb[nonrare]
+        w = np.sqrt(np.maximum(cts[nonrare], 0.0))
+
+        km = KMeans(n_clusters=int(num_clusters), random_state=seed, n_init=10)
+        km.fit(X, sample_weight=w)
+        class2cluster[nonrare] = km.labels_
+        clustering_done = True
+
+    null_qhat = get_conformal_quantile_ding(scores2, alpha, default_qhat=np.inf)
+    t_class = np.full((K,), null_qhat, dtype=float)
+
+    if clustering_done:
+        clusters2 = class2cluster[labels2]
+        C = int(class2cluster[nonrare].max()) + 1 if len(nonrare) else 0
+
+        cluster_qhat = np.full((C,), np.inf, dtype=float)
+        for c in range(C):
+            sc = scores2[clusters2 == c]
+            cluster_qhat[c] = get_conformal_quantile_ding(sc, alpha, default_qhat=np.inf)
+
+        for k in nonrare:
+            ck = class2cluster[k]
+            if ck >= 0:
+                t_class[k] = cluster_qhat[ck]
+
+    info = {
+        "thresh": float(thresh),
+        "num_rare": float(len(rare_classes)),
+        "gamma": float(frac_clustering),
+        "M": float(num_clusters),
+        "clustering_done": float(clustering_done),
+    }
+    return t_class, class2cluster, info
+
+
+# ============================================================
+# SCCP utilities
+# ============================================================
+
+def parse_csv_floats(s: str) -> List[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+
+def parse_csv_ints(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip() != ""]
+
+def class_quantile_embedding_from_vector(
+    v_true: np.ndarray, y: np.ndarray, K: int, q_grid: np.ndarray, fallback_global: bool = True
+) -> np.ndarray:
+    """
+    v_true: (n,) scalar per sample (e.g., true-label score, or -true-logit)
+    y: (n,)
+    Returns emb: (K, len(q_grid))
+    """
+    q_grid = np.asarray(q_grid, dtype=np.float64)
+    emb = np.zeros((K, len(q_grid)), dtype=np.float64)
+
+    if fallback_global:
+        gq = np.quantile(v_true, q_grid, method="higher") if len(v_true) else np.zeros(len(q_grid))
+    else:
+        gq = np.zeros(len(q_grid))
+
+    for k in range(K):
+        mk = (y == k)
+        if mk.any():
+            emb[k] = np.quantile(v_true[mk], q_grid, method="higher")
+        else:
+            emb[k] = gq
+
+    bad = ~np.isfinite(emb)
+    if bad.any():
+        emb[bad] = np.take(gq, np.where(bad)[1])
+    return emb
+
+def kmeans_labels_on_classes(
+    X_class: np.ndarray,  # (K, d)
+    n_clusters: int,
+    seed: int,
+    class_weight: Optional[np.ndarray] = None,  # (K,)
+    weighted_kmeans: bool = True,
+) -> np.ndarray:
+    K = X_class.shape[0]
+    n_clusters = max(1, min(int(n_clusters), K))
+
+    if (KMeans is not None) and weighted_kmeans and (n_clusters > 1):
+        w = None
+        if class_weight is not None:
+            w = np.asarray(class_weight, dtype=float)
+            w = np.where(np.isfinite(w) & (w > 0), w, 1.0)
+        km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
+        km.fit(X_class, sample_weight=w)
+        return km.labels_.astype(int)
+
+    # fallback: unweighted simple kmeans
+    rng = np.random.default_rng(seed)
+    centers = X_class[rng.choice(K, size=n_clusters, replace=False)].copy()
+    labels = np.zeros(K, dtype=int)
+    for _ in range(50):
+        d2 = ((X_class[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        new_labels = d2.argmin(axis=1)
+        if np.all(new_labels == labels):
+            break
+        labels = new_labels
+        for c in range(n_clusters):
+            m = (labels == c)
+            if m.any():
+                centers[c] = X_class[m].mean(axis=0)
+            else:
+                centers[c] = X_class[rng.integers(0, K)]
+    return labels.astype(int)
+
+def sccp_fit_thresholds(
+    scores_all_D2: np.ndarray, y_D2: np.ndarray,
+    class2cluster: np.ndarray,
+    alpha: float,
+    tau: float,
+    beta: float,
+) -> np.ndarray:
+    """
+    Compute per-class thresholds using:
+      - global threshold on D2
+      - cluster threshold on D2
+      - per-class shrinkage weight tau_y = tau/(tau + n_y^beta)
+        and mix cluster->global (simple)
+    """
+    y_D2 = np.asarray(y_D2, dtype=int)
+    n2, K = scores_all_D2.shape
+    scores_true_D2 = scores_all_D2[np.arange(n2), y_D2]
+
+    t_global = quantile_upper_conservative(scores_true_D2, alpha)
+
+    C = int(np.max(class2cluster)) + 1
+    t_cluster = np.full((C,), t_global, dtype=float)
+    n_cluster = np.zeros((C,), dtype=int)
+
+    for c in range(C):
+        cls_in_c = np.where(class2cluster == c)[0]
+        m = np.isin(y_D2, cls_in_c)
+        n_cluster[c] = int(m.sum())
+        if m.any():
+            t_cluster[c] = quantile_upper_conservative(scores_true_D2[m], alpha)
+        else:
+            t_cluster[c] = t_global
+
+    # optional: cluster->global shrinkage via same tau, using n_cluster
+    t_mix_cluster = np.zeros((C,), dtype=float)
+    for c in range(C):
+        nc = float(n_cluster[c])
+        wc = nc / (nc + tau) if (nc + tau) > 0 else 0.0
+        t_mix_cluster[c] = wc * t_cluster[c] + (1.0 - wc) * t_global
+
+    counts = np.bincount(y_D2, minlength=K).astype(float)
+    t_class = np.zeros((K,), dtype=float)
+
+    for y in range(K):
+        ny = float(counts[y])
+        denom = tau + (ny ** float(beta))
+        tau_y = (tau / denom) if denom > 0 else 1.0  # in [0,1]
+        cy = int(class2cluster[y])
+        t_class[y] = (1.0 - tau_y) * t_mix_cluster[cy] + tau_y * t_global
+
+    return t_class
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+def eval_metrics(
+    scores_all: np.ndarray,
     y: np.ndarray,
-    K: int,
-    class2cluster: Optional[np.ndarray] = None,
+    t: np.ndarray,
+    alpha: float,
     tail_set: Optional[np.ndarray] = None,
-) -> Dict[str, object]:
-    """
-    Returns overall, classwise, tail/head (optional), and (optional) clusterwise metrics.
-    """
-    n, K2 = S.shape
-    assert K2 == K
-
+) -> Dict[str, float]:
     y = np.asarray(y, dtype=int)
+    n, K = scores_all.shape
+
+    t = np.asarray(t, dtype=float)
+    S = (scores_all <= t[None, :])
 
     hit = S[np.arange(n), y].astype(float)
-    size_i = S.sum(axis=1).astype(float)
+    set_sizes = S.sum(axis=1).astype(float)
 
-    out: Dict[str, object] = {}
-    out["coverage"] = float(np.mean(hit))
-    out["avg_size"] = float(np.mean(size_i))
-
-    # ---- tail/head (samplewise, by true label) ----
-    if tail_set is not None:
-        tail_set = np.asarray(tail_set, dtype=int)
-        is_tail = np.isin(y, tail_set)
-        is_head = ~is_tail
-
-        out["n_tail"] = int(is_tail.sum())
-        out["n_head"] = int(is_head.sum())
-
-        out["cov_tail"] = float(np.mean(hit[is_tail])) if is_tail.any() else float("nan")
-        out["cov_head"] = float(np.mean(hit[is_head])) if is_head.any() else float("nan")
-        out["size_tail"] = float(np.mean(size_i[is_tail])) if is_tail.any() else float("nan")
-        out["size_head"] = float(np.mean(size_i[is_head])) if is_head.any() else float("nan")
-
-    # ---- classwise ----
     cov_k = np.full(K, np.nan, dtype=float)
-    size_k = np.full(K, np.nan, dtype=float)
     n_k = np.zeros(K, dtype=int)
-
     for k in range(K):
         m = (y == k)
         n_k[k] = int(m.sum())
         if n_k[k] > 0:
             cov_k[k] = float(np.mean(hit[m]))
-            size_k[k] = float(np.mean(size_i[m]))
 
-    out["n_class"] = n_k.tolist()
-    out["cov_class"] = cov_k.tolist()
-    out["size_class"] = size_k.tolist()
-    out["worst_class_cov"] = float(np.nanmin(cov_k))
-    out["std_class_cov"] = float(np.nanstd(cov_k))
-    out["avg_class_cov"] = float(np.nanmean(cov_k))
+    covgap = float(np.nanmean(np.abs(cov_k - (1.0 - alpha))))
+    maxgap = float(np.nanmax(np.abs(cov_k - (1.0 - alpha))))
 
-    # ---- clusterwise (if mapping provided) ----
-    if class2cluster is not None:
-        class2cluster = np.asarray(class2cluster, dtype=int)
-        C = int(class2cluster.max()) + 1
+    out = {
+        "marginal_cov": float(np.mean(hit)),
+        "avg_size": float(np.mean(set_sizes)),
+        "covgap": covgap,
+        "maxgap": maxgap,
+        "avg_class_cov": float(np.nanmean(cov_k)),
+        "worst_class_cov": float(np.nanmin(cov_k)),
+        "std_class_cov": float(np.nanstd(cov_k)),
+    }
 
-        cov_c = np.full(C, np.nan, dtype=float)
-        size_c = np.full(C, np.nan, dtype=float)
-        n_c = np.zeros(C, dtype=int)
+    if tail_set is not None:
+        tail_set = np.asarray(tail_set, dtype=int)
+        is_tail = np.isin(y, tail_set)
+        is_head = ~is_tail
 
-        y_cluster = class2cluster[y]
-
-        for c in range(C):
-            m = (y_cluster == c)
-            n_c[c] = int(m.sum())
-            if n_c[c] > 0:
-                cov_c[c] = float(np.mean(hit[m]))
-                size_c[c] = float(np.mean(size_i[m]))
-
-        out["n_cluster"] = n_c.tolist()
-        out["cov_cluster"] = cov_c.tolist()
-        out["size_cluster"] = size_c.tolist()
-        out["worst_cluster_cov"] = float(np.nanmin(cov_c))
-        out["std_cluster_cov"] = float(np.nanstd(cov_c))
-        out["avg_cluster_cov"] = float(np.nanmean(cov_c))
+        out.update({
+            "n_tail": int(is_tail.sum()),
+            "n_head": int(is_head.sum()),
+            "cov_tail": float(np.mean(hit[is_tail])) if is_tail.any() else float("nan"),
+            "cov_head": float(np.mean(hit[is_head])) if is_head.any() else float("nan"),
+            "size_tail": float(np.mean(set_sizes[is_tail])) if is_tail.any() else float("nan"),
+            "size_head": float(np.mean(set_sizes[is_head])) if is_head.any() else float("nan"),
+        })
 
     return out
 
-# ----------------------------
-# SCCP: clustering classes + shrinkage of class-quantiles
-# ----------------------------
 
-import numpy as np
-
-def class_quantile_embedding(
-    scores_sel: np.ndarray,   # shape (n_sel,)
-    y_sel: np.ndarray,        # shape (n_sel,)
-    K: int,
-    q_grid: np.ndarray,       # e.g., [0.5,0.6,0.7,0.8,0.9,1-alpha]
-    fallback: str = "global", # or "nan_to_global"
-) -> np.ndarray:
-    """
-    For each class k, embed it by quantiles of its score distribution on selection set:
-        emb_k[j] = Quantile_{q_grid[j]}( scores_sel | y_sel=k ).
-    If class has no selection samples, fallback to global quantiles.
-    """
-    q_grid = np.asarray(q_grid, dtype=np.float64)
-    d = len(q_grid)
-
-    emb = np.zeros((K, d), dtype=np.float64)
-
-    # global fallback quantiles
-    global_q = np.quantile(scores_sel, q_grid, method="higher")
-
-    for k in range(K):
-        m = (y_sel == k)
-        if m.any():
-            emb[k] = np.quantile(scores_sel[m], q_grid, method="higher")
-        else:
-            emb[k] = global_q
-
-    # replace non-finite just in case
-    bad = ~np.isfinite(emb)
-    if bad.any():
-        emb[bad] = np.take(global_q, np.where(bad)[1])
-
-    return emb
-
-def kmeans_simple(X: np.ndarray, n_clusters: int, seed: int = 1, n_iter: int = 50) -> np.ndarray:
-    # Minimal k-means (no sklearn dependency)
-    rng = np.random.default_rng(seed)
-    N = X.shape[0]
-    # init centers by random points
-    centers = X[rng.choice(N, size=n_clusters, replace=False)].copy()
-    labels = np.zeros(N, dtype=int)
-    for _ in range(n_iter):
-        # assign
-        d2 = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        new_labels = d2.argmin(axis=1)
-        if np.all(new_labels == labels):
-            break
-        labels = new_labels
-        # update
-        for c in range(n_clusters):
-            m = labels == c
-            if m.any():
-                centers[c] = X[m].mean(axis=0)
-            else:
-                centers[c] = X[rng.integers(0, N)]
-    return labels
-
-from typing import Tuple, Optional, List
-import numpy as np
-
-# -------------------------
-# SCCP thresholds (global + cluster shrinkage)
-# -------------------------
-def sccp_thresholds(
-    P_sel: np.ndarray,
-    y_sel: np.ndarray,
-    P_cal: np.ndarray,
-    y_cal: np.ndarray,
-    alpha: float,
-    n_clusters: int = 10,
-    shrink_tau: float = 50.0,
-    seed: int = 1,
-    embed_mode: str = "score_quantile",
-    q_grid: Optional[List[float]] = None,
-    cluster_mode : str = 'plain'
-      # 'plain' or 'cccp_null'
-) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Return:
-      - t_class: per-class thresholds (CCCP-like; reporting)
-      - t_cluster: per-cluster thresholds
-      - global_t: global threshold
-      - t_mix_cluster: per-cluster mixed thresholds (cluster+global shrinkage)
-      - t_sccp: per-class SCCP thresholds (inherit cluster mixed threshold)
-      - c_labels: class->cluster mapping
-    """
-    K = P_cal.shape[1]
-
-    scores_sel = score_s1(P_sel, y_sel)
-    scores_cal = score_s1(P_cal, y_cal)
-    global_t = quantile_upper(scores_cal, alpha)
-
-    # --- embedding for clustering ---
-    if embed_mode == "prob_mean":
-        emb = np.zeros((K, K), dtype=np.float64)
-        for k in range(K):
-            m = (y_sel == k)
-            emb[k] = P_sel[m].mean(axis=0) if m.any() else 0.0
-
-    elif embed_mode == "score_quantile":
-        if q_grid is None:
-            q_grid = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0 - alpha]
-        q_grid_arr = np.array(q_grid, dtype=np.float64)
-
-        # quantile embedding (null 없이도 안정적으로 채우기 위해 global로 fallback)
-        emb = class_quantile_embedding(
-            scores_sel=scores_sel, y_sel=y_sel, K=K, q_grid=q_grid_arr, fallback="global"
-        )
-    else:
-        raise ValueError(f"Unknown embed_mode={embed_mode}")
-
-    # --- cluster classes: CCCP-style(null) OR plain k-means ---
-    if cluster_mode == "cccp_null":
-        if embed_mode != "score_quantile":
-            raise ValueError("cluster_mode='cccp_null' requires embed_mode='score_quantile'")
-
-        c_labels, C_eff, is_null = cluster_classes_cccp_style(
-            scores_sel=scores_sel,
-            y_sel=y_sel,
-            K=K,
-            q_grid=q_grid_arr,
-            alpha=alpha,
-            n_clusters=n_clusters,
-            seed=seed,
-        )
-
-    elif cluster_mode == "plain" :
-        c_labels = kmeans_simple(emb, n_clusters=n_clusters, seed=seed)
-        C = int(n_clusters)
-    else:
-        raise ValueError(f"Unknown cluster_mode={cluster_mode}")
-
-
-    # class thresholds (optional CCCP-like)
-    t_class = np.full(K, np.nan, dtype=np.float64)
-    for k in range(K):
-        m = (y_cal == k)
-        if m.any():
-            t_class[k] = quantile_upper(scores_cal[m], alpha)
-
-    # ------------------------------------------------------------
-    # cluster thresholds (compute ONCE, using effective cluster count)
-    # ------------------------------------------------------------
-    C = int(C_eff) if ("C_eff" in locals() and C_eff is not None) else int(n_clusters)
-
-    t_cluster_arr = np.full(C, np.nan, dtype=np.float64)  # cluster-wise thresholds
-    n_cluster = np.zeros(C, dtype=np.int64)
-
-    for c in range(C):
-        cls_in_c = np.where(c_labels == c)[0]
-        m = np.isin(y_cal, cls_in_c)
-        n_cluster[c] = int(m.sum())
-        if m.any():
-            t_cluster_arr[c] = quantile_upper(scores_cal[m], alpha)
-        else:
-            t_cluster_arr[c] = global_t  # safe fallback
-
-    # ------------------------------------------------------------
-    # global + cluster shrinkage (per cluster)  -> t_mix_cluster
-    # ------------------------------------------------------------
-    t_mix_cluster = np.zeros(C, dtype=np.float64)
-    for c in range(C):
-        tc = t_cluster_arr[c] if np.isfinite(t_cluster_arr[c]) else global_t
-        nc = n_cluster[c]
-        wc = nc / (nc + shrink_tau) if (nc + shrink_tau) > 0 else 0.0
-        t_mix_cluster[c] = wc * tc + (1.0 - wc) * global_t
-
-    # If using cccp_null, enforce null cluster uses global threshold
-    if cluster_mode == "cccp_null":
-        null_id = C - 1
-        t_mix_cluster[null_id] = global_t
-
-    # ------------------------------------------------------------
-    # per-class SCCP threshold (class shrinkage toward global, centered at cluster-mixed target)
-    # ------------------------------------------------------------
-    counts_cal = np.bincount(y_cal, minlength=K).astype(int)
-    t_sccp = np.zeros(K, dtype=np.float64)
-
-    for y in range(K):
-        ny = int(counts_cal[y])
-        tau_y = shrink_tau / (shrink_tau + ny) if (shrink_tau + ny) > 0 else 1.0
-        cy = int(c_labels[y])
-        if cy < 0 or cy >= C:
-            raise ValueError(f"class {y}: cluster id {cy} out of range [0, {C-1}]")
-        # target = cluster-mixed threshold; then shrink class toward global depending on ny
-        t_sccp[y] = (1.0 - tau_y) * t_mix_cluster[cy] + tau_y * global_t
-
-    # (reporting) per-class CCCP thresholds computed earlier: t_class
-
-    return t_class, t_cluster_arr, global_t, t_mix_cluster, t_sccp, c_labels
-
-    
-
-
-
-# -------------------------
-# SCCP-only evaluator for sweep
-# -------------------------
-def eval_one_method_sccp(
-    P_test: np.ndarray,
-    y_test: np.ndarray,
-    t_sccp: np.ndarray,
-    class2cluster: np.ndarray,
-    K: int,
-) -> Dict[str, float]:
-    S = P_test >= (1.0 - t_sccp[None, :])
-    e = eval_sets(S, y_test, K=K, class2cluster=class2cluster)
-    return {
-        "cov": float(e.get("coverage", np.nan)),
-        "size": float(e.get("avg_size", np.nan)),
-        "avg_clu": float(e.get("avg_cluster_cov", np.nan)),
-        "worst_clu": float(e.get("worst_cluster_cov", np.nan)),
-        "std_clu": float(e.get("std_cluster_cov", np.nan)),
-    }
-
-
-
-# ----------------------------
-# Main runner
-# ----------------------------
-
-# -------------------------
-# Helpers
-# -------------------------
-def parse_float_list(s: str) -> List[float]:
-    return [float(x) for x in s.split(",") if x.strip() != ""]
+# ============================================================
+# Printing helpers
+# ============================================================
 
 @dataclass
-class Results:
+class Row:
     method: str
-    coverage: float = float("nan")
-    avg_size: float = float("nan")
-    avg_class_cov: float = float("nan")
-    worst_class_cov: float = float("nan")
-    std_class_cov: float = float("nan")
-    avg_cluster_cov: float = float("nan")
-    worst_cluster_cov: float = float("nan")
-    std_cluster_cov: float = float("nan")
+    marginal_cov: float
+    avg_size: float
+    covgap: float
+    cov_tail: float = float("nan")
+    size_tail: float = float("nan")
+    cov_head: float = float("nan")
+    size_head: float = float("nan")
+
+def fmt_row(r: Row) -> str:
+    return (
+        f"{r.method:10s} | {r.marginal_cov:7.4f} | {r.avg_size:9.2f} | {r.covgap:7.4f} | "
+        f"{r.cov_tail:7.4f} | {r.size_tail:8.2f} | {r.cov_head:7.4f} | {r.size_head:8.2f}"
+    )
 
 
-def pick_summary(e: Dict) -> Dict:
-    keys = [
-        "coverage", "avg_size",
-        "avg_class_cov", "worst_class_cov", "std_class_cov",
-        "avg_cluster_cov", "worst_cluster_cov", "std_cluster_cov",
-    ]
-    return {k: e.get(k, float("nan")) for k in keys}
-
-# -------------------------
+# ============================================================
 # Main
-# -------------------------
+# ============================================================
+
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--npz", type=str, required=True)
+    ap.add_argument("--K", type=int, required=True)
     ap.add_argument("--alpha", type=float, default=0.1)
-    ap.add_argument("--K", type=int, default=100)
+    ap.add_argument("--seed", type=int, default=1)
+
+    # Score choice
+    ap.add_argument("--score", type=str, default="softmax", choices=["softmax", "aps", "raps"])
+    ap.add_argument("--scores", type=str, default="", help="Comma-separated list among softmax,aps,raps. If set, overrides --score and runs all.")
+    ap.add_argument("--no_randomize", action="store_true")
+    ap.add_argument("--raps_lambda", type=float, default=0.0)
+    ap.add_argument("--raps_kreg", type=int, default=1)
+
+    # SCCP hyperparams (fixed-run fallback)
     ap.add_argument("--clusters", type=int, default=10)
     ap.add_argument("--tau", type=float, default=50.0)
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--out", type=str, default="")
+    ap.add_argument("--beta", type=float, default=0.5, help="Shrinkage exponent beta in tau/(tau + n_y^beta). Default 0.5.")
 
-    # --- Tail definition controls ---
-    ap.add_argument("--tail_frac", type=float, default=0.2,
-                    help="Tail fraction for defining tail classes (bottom tail_frac by counts_pool).")
-    ap.add_argument("--tail_mode", type=str, default="npz",
-                    choices=["npz", "counts_pool", "override"],
-                    help=("How to define tail_set. "
-                          "'npz': use tail_set from NPZ if available, else counts_pool. "
-                          "'counts_pool': always use counts_pool-derived tail_set. "
-                          "'override': ignore NPZ tail_set and recompute using tail_frac from counts_pool."))
+    ap.add_argument("--q_grid", type=str, default=None, help="Comma-separated quantiles for SCCP embedding. default includes 1-alpha.")
+    ap.add_argument("--emb_source", type=str, default="logit", choices=["logit", "score"],
+                    help="Embedding source for clustering: logit uses -true_logit (needs logits in npz), score uses true-label score from chosen score.")
+    ap.add_argument("--weighted_kmeans", action="store_true", help="Use sklearn KMeans with class weights ~ sqrt(class count) (D1).")
 
+    # Data-dependent selection via calibration split
+    ap.add_argument("--use_calib_split", action="store_true",
+                    help="Split calibration into D1/D2/D3; tune (Kc,tau) by minimizing covgap on D3.")
+    ap.add_argument("--calib_fracs", type=str, default="0.33,0.34,0.33",
+                    help="Fractions for D1,D2,D3 split of calibration. e.g. '0.33,0.34,0.33'")
+    ap.add_argument("--kc_grid", type=str, default="10", help="Comma-separated Kc candidates for tuning.")
+    ap.add_argument("--tau_grid", type=str, default="50", help="Comma-separated tau candidates for tuning.")
 
-    # --- Top-M diagnostics ---
-    ap.add_argument("--report_topM", action="store_true",
-                    help="Print true-label rank / top-M accuracy diagnostics.")
-    ap.add_argument("--topM_list", type=str, default="1,5,10,20,50,100,200,500,1000",
-                    help="Comma-separated M values for top-M accuracy.")
-    ap.add_argument("--topM_split", type=str, default="test",
-                    choices=["sel", "cal", "test", "all"],
-                    help="Which split(s) to report: sel/cal/test/all.")
+    # CCCP(Ding) optional
+    ap.add_argument("--run_cccp", action="store_true", help="Also run Ding CCCP for comparison.")
+    ap.add_argument("--cccp_gamma", type=float, default=0.5)
+    ap.add_argument("--cccp_M", type=int, default=10)
 
-    # --- Sweep controls ---
-    ap.add_argument("--sweep", action="store_true",
-                    help="Run SCCP sweep over tau/clusters and exit.")
-    ap.add_argument("--tau_list", type=str, default="50",
-                    help="Comma-separated tau values for sweep, e.g., 1,5,10,50,200")
-    ap.add_argument("--clusters_list", type=str, default=None,
-                    help="Comma-separated Kc values for sweep, e.g., 5,10,20. If None, use --clusters")
+    # Tail controls
+    ap.add_argument("--tail_frac", type=float, default=0.2)
+    ap.add_argument("--tail_mode", type=str, default="npz", choices=["npz", "counts_pool", "override"])
 
-    # --- Embedding controls ---
-    ap.add_argument("--embed", type=str, default="score_quantile",
-                    choices=["prob_mean", "score_quantile"])
-    ap.add_argument("--q_grid", type=str, default=None,
-                    help="Comma-separated quantiles for score_quantile embedding, e.g., 0.5,0.6,0.7,0.8,0.9")
+    ap.add_argument("--out", type=str, default="", help="Save json to path")
 
     args = ap.parse_args()
+    randomize = (not args.no_randomize)
 
-    print("=== DEBUG: class/cluster metrics enabled ===")
-    splits = load_npz_splits(args.npz, K=args.K, fallback_split_seed=args.seed)
-    # --- define tail/head classes (CIFAR-LT standard: based on train-pool counts) ---
-    z_npz = np.load(args.npz, allow_pickle=True)
-
-    # --- tail_set construction helper ---
-    def _tail_from_counts(counts_pool: np.ndarray, K: int, tail_frac: float) -> np.ndarray:
-        counts_pool = np.asarray(counts_pool, dtype=float)
-        if counts_pool.shape[0] != K:
-            raise ValueError(f"counts_pool length {counts_pool.shape[0]} != K={K}")
-        m = int(np.ceil(float(tail_frac) * K))
-        m = max(0, min(m, K))
-        order = np.argsort(counts_pool)  # ascending (smallest counts = tail)
-        return order[:m].astype(int)
-
-    K = args.K
-    has_tail = ("tail_set" in z_npz.files)
-    has_counts = ("counts_pool" in z_npz.files)
-
-    if args.tail_mode == "npz":
-        if has_tail:
-            tail_set = np.asarray(z_npz["tail_set"], dtype=int)
-        elif has_counts:
-            tail_set = _tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=args.tail_frac)
-        else:
-            raise ValueError("Need tail_set or counts_pool in NPZ to define tail classes.")
-
-    elif args.tail_mode == "counts_pool":
-        if not has_counts:
-            raise ValueError("tail_mode='counts_pool' requires counts_pool in NPZ.")
-        tail_set = _tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=args.tail_frac)
-
-    elif args.tail_mode == "override":
-        # ignore tail_set even if present; recompute from counts_pool
-        if not has_counts:
-            raise ValueError("tail_mode='override' requires counts_pool in NPZ to recompute tail_set.")
-        tail_set = _tail_from_counts(z_npz["counts_pool"], K=K, tail_frac=args.tail_frac)
-
+    # which scores to run
+    if args.scores.strip():
+        score_list = [s.strip().lower() for s in args.scores.split(",") if s.strip()]
+        for s in score_list:
+            if s not in ["softmax", "aps", "raps"]:
+                raise ValueError(f"Invalid score in --scores: {s}")
     else:
-        raise ValueError(f"Unknown tail_mode={args.tail_mode}")
+        score_list = [args.score.lower()]
 
-    print(f"[tail] mode={args.tail_mode} tail_frac={args.tail_frac} m={len(tail_set)}")
-    
+    # Load splits (probs)
+    splits = load_npz_splits(args.npz, K=args.K, fallback_split_seed=args.seed)
+    P_sel, y_sel = splits["sel"]
     P_cal, y_cal = splits["cal"]
     P_test, y_test = splits["test"]
 
-    if "sel" in splits:
-        P_sel, y_sel = splits["sel"]
-    else:
-        P_sel, y_sel = P_cal, y_cal
+    # Optional logits
+    logits = load_npz_logits(args.npz, K=args.K)
 
-    q_grid = parse_float_list(args.q_grid) if args.q_grid is not None else None
+    z_npz = np.load(args.npz, allow_pickle=True)
+    tail_set = build_tail_set_from_npz(z_npz, K=args.K, tail_frac=args.tail_frac, tail_mode=args.tail_mode)
 
-    # ============================================================
-    # SCCP SWEEP MODE
-    # ============================================================
-    if args.sweep:
-        tau_vals = parse_float_list(args.tau_list)
-        kc_vals = _parse_int_list(args.clusters_list) if args.clusters_list else [args.clusters]
+    # Parse q_grid
+    q_grid = None
+    if args.q_grid is not None:
+        q_grid = parse_csv_floats(args.q_grid)
+    if q_grid is None:
+        q_grid = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0 - float(args.alpha)]
+    q_grid = np.asarray(q_grid, dtype=np.float64)
 
-        print(f"[file] {args.npz}")
-        print(f"[alpha] {args.alpha}  [seed] {args.seed}  [embed] {args.embed}"
-              f"{'' if q_grid is None else f'  [q_grid]={q_grid}'}")
-        print("\nSweep results (SCCP only):")
-        print("Kc | tau  |  cov  | size | covT |  szT | covH |  szH | avg_clu | worst_clu | std_clu")
-        print("--------------------------------------------------------------------------------------")
+    # Parse calib split
+    fracs = np.asarray(parse_csv_floats(args.calib_fracs), dtype=float)
+    if fracs.shape[0] != 3 or np.any(fracs <= 0):
+        raise ValueError("--calib_fracs must have 3 positive numbers, e.g. '0.33,0.34,0.33'")
+    fracs = fracs / fracs.sum()
 
+    kc_grid = parse_csv_ints(args.kc_grid)
+    tau_grid = parse_csv_floats(args.tau_grid)
+    if len(kc_grid) == 0 or len(tau_grid) == 0:
+        raise ValueError("--kc_grid and --tau_grid must be non-empty.")
 
-        for Kc in kc_vals:
-            for tau in tau_vals:
-                _, _, _, _, t_sccp, class2cluster = sccp_thresholds(
-                    P_sel=P_sel, y_sel=y_sel,
-                    P_cal=P_cal, y_cal=y_cal,
-                    alpha=args.alpha,
-                    n_clusters=Kc,
-                    shrink_tau=tau,
-                    seed=args.seed,
-                    embed_mode=args.embed,
-                    q_grid=q_grid,
-                )
-                S = P_test >= (1.0 - t_sccp[None, :])
-                res = eval_sets(S, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
+    rng = np.random.default_rng(args.seed)
 
-                cov  = res["coverage"]
-                size = res["avg_size"]
-
-                covT = res.get("cov_tail", float("nan"))
-                szT  = res.get("size_tail", float("nan"))
-                covH = res.get("cov_head", float("nan"))
-                szH  = res.get("size_head", float("nan"))
-
-                avg_clu   = res.get("avg_cluster_cov", float("nan"))
-                worst_clu = res.get("worst_cluster_cov", float("nan"))
-                std_clu   = res.get("std_cluster_cov", float("nan"))
-
-                print(f"{Kc:2d} | {tau:4.0f} | {cov:5.3f} | {size:4.1f} | "
-                    f"{covT:5.3f} | {szT:4.1f} | {covH:5.3f} | {szH:4.1f} | "
-                    f"{avg_clu:7.4f} | {worst_clu:9.4f} | {std_clu:7.4f}")
-
-        return
-
-    # ============================================================
-    # SINGLE-RUN MODE (GCP/CCCP/SCCP table)
-    # ============================================================
-
-    # --- SCCP thresholds for the single run (IMPORTANT: do not reuse sweep leftovers) ---
-    t_class_s, t_cluster_s, global_t_s, t_mix_cluster_s, t_sccp_s, class2cluster_s = sccp_thresholds(
-        P_sel=P_sel, y_sel=y_sel,
-        P_cal=P_cal, y_cal=y_cal,
-        alpha=args.alpha,
-        n_clusters=args.clusters,
-        shrink_tau=args.tau,
-        seed=args.seed,
-        embed_mode=args.embed,
-        q_grid=q_grid,
-        cluster_mode = 'plain',
-    )
-    class2cluster = class2cluster_s
-    t_sccp = t_sccp_s
-
-    # --- GCP ---
-    t_global = quantile_upper(score_s1(P_cal, y_cal), args.alpha)
-    S_gcp = predset_from_threshold(P_test, t_global)
-    eg = eval_sets(S_gcp, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
-
-    # --- CCCP (use global fallback for missing classes) ---
-    scores_cal = score_s1(P_cal, y_cal)
-    K = args.K
-    t_class = np.zeros(K, dtype=np.float64)
-    for k in range(K):
-        m = (y_cal == k)
-        if m.any():
-            t_class[k] = quantile_upper(scores_cal[m], args.alpha)
-        else:
-            t_class[k] = t_global
-    S_cccp = P_test >= (1.0 - t_class[None, :])
-    ec = eval_sets(S_cccp, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
-
-    # --- SCCP ---
-    S_sccp = P_test >= (1.0 - t_sccp[None, :])
-    es = eval_sets(S_sccp, y_test, K=args.K, class2cluster=class2cluster, tail_set=tail_set)
-    rows = [
-        Results("GCP", **pick_summary(eg)),
-        Results("CCCP", **pick_summary(ec)),
-        Results("SCCP", **pick_summary(es)),
-    ]
-
-    def _get(e, key, default=float("nan")):
-        v = e.get(key, default)
-        try:
-            return float(v)
-        except Exception:
-            return default
-
-    def _row(method: str, e: dict):
-        return {
-            "method": method,
-            "cov": _get(e, "coverage"),
-            "size": _get(e, "avg_size"),
-            "covT": _get(e, "cov_tail"),
-            "szT": _get(e, "size_tail"),
-            "covH": _get(e, "cov_head"),
-            "szH": _get(e, "size_head"),
-            "avg_cls": _get(e, "avg_class_cov"),
-            "worst_cls": _get(e, "worst_class_cov"),
-            "std_cls": _get(e, "std_class_cov"),
-            "avg_clu": _get(e, "avg_cluster_cov"),
-            "worst_clu": _get(e, "worst_cluster_cov"),
-            "std_clu": _get(e, "std_cluster_cov"),
-        }
-    tab = [
-        _row("GCP", eg),
-        _row("CCCP", ec),
-        _row("SCCP", es),
-    ]
-
-
-    # --- Print results table ---
+    # Header
     print(f"[file] {args.npz}")
-    print(f"[alpha] {args.alpha}  [clusters] {args.clusters}  [tau] {args.tau}  [seed] {args.seed}")
+    print(f"[K] {args.K}  [alpha] {args.alpha}  [seed] {args.seed}")
+    print(f"[tail] mode={args.tail_mode} tail_frac={args.tail_frac} m={len(tail_set)}")
+    print(f"[SCCP] emb_source={args.emb_source} weighted_kmeans={args.weighted_kmeans} beta={args.beta}")
+    if args.use_calib_split:
+        print(f"[Cal split] D1,D2,D3 fracs={fracs.tolist()}  kc_grid={kc_grid} tau_grid={tau_grid}")
     print("")
-    print("method |   cov  |  size |  covT |   szT |  covH |   szH | avg_cls | worst_cls | std_cls | avg_clu | worst_clu | std_clu")
-    print("-" * 118)
 
-    for r in tab:
-        print(f"{r['method']:6s} | {r['cov']:6.4f} | {r['size']:5.1f} | "
-            f"{r['covT']:5.3f} | {r['szT']:5.1f} | {r['covH']:5.3f} | {r['szH']:5.1f} | "
-            f"{r['avg_cls']:7.4f} | {r['worst_cls']:9.4f} | {r['std_cls']:7.4f} | "
-            f"{r['avg_clu']:7.4f} | {r['worst_clu']:9.4f} | {r['std_clu']:7.4f}")
+    all_out = {"npz": args.npz, "K": args.K, "alpha": args.alpha, "seed": args.seed, "results": {}}
 
+    # ============================================================
+    # Run per score
+    # ============================================================
+    for score_name in score_list:
+        # Compute score matrices
+        scores_sel = get_scores_all(P_sel, score_name, seed=args.seed, raps_lambda=args.raps_lambda, raps_kreg=args.raps_kreg, randomize=randomize)
+        scores_cal = get_scores_all(P_cal, score_name, seed=args.seed, raps_lambda=args.raps_lambda, raps_kreg=args.raps_kreg, randomize=randomize)
+        scores_test = get_scores_all(P_test, score_name, seed=args.seed, raps_lambda=args.raps_lambda, raps_kreg=args.raps_kreg, randomize=randomize)
 
-    # --- Top-M diagnostics ---
-    if args.report_topM:
-        Ms = _parse_int_list(args.topM_list)
+        # -------- GCP (global) threshold on cal
+        scores_true_cal = scores_cal[np.arange(scores_cal.shape[0]), y_cal]
+        t_global = quantile_upper_conservative(scores_true_cal, args.alpha)
+        eg = eval_metrics(scores_test, y_test, np.full((args.K,), t_global), alpha=args.alpha, tail_set=tail_set)
 
-        def _print_topM(tag: str, P: np.ndarray, y: np.ndarray):
-            s = summarize_topM(P, y, Ms=Ms)
-            rq = s["rank_quantiles"]
-            print(f"\n[Top-M diagnostics: {tag}] n={s['n']}")
-            print(f"  rank mean={s['rank_mean']:.2f} | q50={rq['q50']:.0f} q90={rq['q90']:.0f} "
-                  f"q95={rq['q95']:.0f} q99={rq['q99']:.0f}")
-            print("  top-M accuracy:")
-            for M in Ms:
-                print(f"    top-{M:<4d}: {s['topM_acc'][M]:.4f}")
+        # -------- CCCP (optional)
+        ec = None
+        info_cccp = None
+        if args.run_cccp:
+            t_cccp, c2c_cccp, info_cccp = cccp_thresholds_ding(
+                scores_all_totalcal=scores_cal,
+                y_totalcal=y_cal,
+                alpha=args.alpha,
+                frac_clustering=args.cccp_gamma,
+                num_clusters=args.cccp_M,
+                seed=args.seed,
+                embed_q=(0.5, 0.6, 0.7, 0.8, 0.9),
+            )
+            ec = eval_metrics(scores_test, y_test, t_cccp, alpha=args.alpha, tail_set=tail_set)
 
-        if args.topM_split in ("sel", "all"):
-            _print_topM("sel", P_sel, y_sel)
-        if args.topM_split in ("cal", "all"):
-            _print_topM("cal", P_cal, y_cal)
-        if args.topM_split in ("test", "all"):
-            _print_topM("test", P_test, y_test)
+        # -------- SCCP (fixed or tuned)
+        if args.use_calib_split:
+            # Split calibration indices into D1/D2/D3
+            n_cal = P_cal.shape[0]
+            perm = rng.permutation(n_cal)
+            n1 = int(round(fracs[0] * n_cal))
+            n2 = int(round(fracs[1] * n_cal))
+            n1 = min(max(n1, 1), n_cal - 2)
+            n2 = min(max(n2, 1), n_cal - n1 - 1)
+            idx1 = perm[:n1]
+            idx2 = perm[n1:n1 + n2]
+            idx3 = perm[n1 + n2:]
 
-    # --- Save JSON output ---
-    if args.out:
-        import json
-        topM_report = {}
-        if args.report_topM:
-            Ms = _parse_int_list(args.topM_list)
-            if args.topM_split in ("sel", "all"):
-                topM_report["sel"] = summarize_topM(P_sel, y_sel, Ms=Ms)
-            if args.topM_split in ("cal", "all"):
-                topM_report["cal"] = summarize_topM(P_cal, y_cal, Ms=Ms)
-            if args.topM_split in ("test", "all"):
-                topM_report["test"] = summarize_topM(P_test, y_test, Ms=Ms)
+            y1, y2, y3 = y_cal[idx1], y_cal[idx2], y_cal[idx3]
+            scores1_all = scores_cal[idx1]
+            scores2_all = scores_cal[idx2]
+            scores3_all = scores_cal[idx3]
 
-        out = {
-            "npz": args.npz,
-            "alpha": args.alpha,
-            "clusters": args.clusters,
-            "tau": args.tau,
-            "seed": args.seed,
-            "embed": args.embed,
-            "q_grid": q_grid,
-            "results": [r.__dict__ for r in rows],
-            "t_global": float(t_global),
-            "t_class": t_class.tolist(),
-            "t_sccp": t_sccp.tolist(),
-            "class2cluster": class2cluster.tolist(),
-            "GCP": eg,
-            "CCCP": ec,
-            "SCCP": es,
-            "topM": topM_report,
+            # D1 embedding source
+            if args.emb_source == "logit":
+                Z_cal = logits.get("cal", None)
+                if Z_cal is None:
+                    raise ValueError("emb_source=logit but NPZ has no logits for 'cal'. Add z_cal/logit_cal to NPZ.")
+                z1 = Z_cal[idx1]
+                # use nonconformity-like scalar: -true_logit
+                v1_true = -z1[np.arange(z1.shape[0]), y1]
+            else:
+                # embedding from true-label score
+                v1_true = scores1_all[np.arange(scores1_all.shape[0]), y1]
+
+            emb = class_quantile_embedding_from_vector(v1_true, y1, K=args.K, q_grid=q_grid, fallback_global=True)
+
+            # class weights: sqrt(class sample size on D1)
+            counts1 = np.bincount(y1, minlength=args.K).astype(float)
+            class_w = np.sqrt(np.maximum(counts1, 0.0))
+
+            # grid search over (Kc, tau) using D3 covgap
+            best = None
+            best_tuple = None
+            best_class2cluster = None
+            best_t = None
+
+            for Kc in kc_grid:
+                c2c = kmeans_labels_on_classes(emb, n_clusters=Kc, seed=args.seed, class_weight=class_w, weighted_kmeans=args.weighted_kmeans)
+                for tau in tau_grid:
+                    t_cls = sccp_fit_thresholds(
+                        scores_all_D2=scores2_all,
+                        y_D2=y2,
+                        class2cluster=c2c,
+                        alpha=args.alpha,
+                        tau=float(tau),
+                        beta=float(args.beta),
+                    )
+                    ed3 = eval_metrics(scores3_all, y3, t_cls, alpha=args.alpha, tail_set=tail_set)
+                    obj = ed3["covgap"]
+                    # tie-break: smaller avg_size on D3
+                    tie = ed3["avg_size"]
+                    cand = (obj, tie)
+                    if best is None or cand < best:
+                        best = cand
+                        best_tuple = (int(Kc), float(tau))
+                        best_class2cluster = c2c.copy()
+                        best_t = t_cls.copy()
+
+            # evaluate chosen SCCP on TEST
+            es = eval_metrics(scores_test, y_test, best_t, alpha=args.alpha, tail_set=tail_set)
+            sccp_info = {"tuned": True, "best_kc": best_tuple[0], "best_tau": best_tuple[1], "beta": float(args.beta)}
+        else:
+            # fixed SCCP: clustering on SEL split (as before), thresholds on CAL split
+            scores_true_sel = scores_sel[np.arange(scores_sel.shape[0]), y_sel]
+
+            if args.emb_source == "logit":
+                Z_sel = logits.get("sel", None)
+                if Z_sel is None:
+                    raise ValueError("emb_source=logit but NPZ has no logits for 'sel'. Add z_sel/logit_sel to NPZ.")
+                v_true = -Z_sel[np.arange(Z_sel.shape[0]), y_sel]
+            else:
+                v_true = scores_true_sel
+
+            emb = class_quantile_embedding_from_vector(v_true, y_sel, K=args.K, q_grid=q_grid, fallback_global=True)
+            counts_sel = np.bincount(y_sel, minlength=args.K).astype(float)
+            class_w = np.sqrt(np.maximum(counts_sel, 0.0))
+
+            c2c = kmeans_labels_on_classes(emb, n_clusters=args.clusters, seed=args.seed, class_weight=class_w, weighted_kmeans=args.weighted_kmeans)
+            t_sccp = sccp_fit_thresholds(scores_all_D2=scores_cal, y_D2=y_cal, class2cluster=c2c, alpha=args.alpha, tau=float(args.tau), beta=float(args.beta))
+            es = eval_metrics(scores_test, y_test, t_sccp, alpha=args.alpha, tail_set=tail_set)
+            sccp_info = {"tuned": False, "clusters": int(args.clusters), "tau": float(args.tau), "beta": float(args.beta)}
+
+        # -------- print block
+        print(f"==================== score={score_name} (randomize={randomize}) ====================")
+        print("method      | marg_cov |  avg_size |  covgap | cov_tail |  sz_tail | cov_head |  sz_head")
+        print("-" * 92)
+
+        rows = [
+            Row("GCP", eg["marginal_cov"], eg["avg_size"], eg["covgap"], eg.get("cov_tail", np.nan), eg.get("size_tail", np.nan), eg.get("cov_head", np.nan), eg.get("size_head", np.nan)),
+        ]
+        if ec is not None:
+            rows.append(Row("CCCP(Ding)", ec["marginal_cov"], ec["avg_size"], ec["covgap"], ec.get("cov_tail", np.nan), ec.get("size_tail", np.nan), ec.get("cov_head", np.nan), ec.get("size_head", np.nan)))
+        rows.append(Row("SCCP", es["marginal_cov"], es["avg_size"], es["covgap"], es.get("cov_tail", np.nan), es.get("size_tail", np.nan), es.get("cov_head", np.nan), es.get("size_head", np.nan)))
+
+        for r in rows:
+            print(fmt_row(r))
+        print("")
+
+        all_out["results"][score_name] = {
+            "score": score_name,
+            "randomize": randomize,
+            "raps_lambda": float(args.raps_lambda),
+            "raps_kreg": int(args.raps_kreg),
+            "GCP": {"t_global": float(t_global), "metrics": eg},
+            "SCCP": {"info": sccp_info, "metrics": es},
         }
+        if ec is not None:
+            all_out["results"][score_name]["CCCP"] = {"info": info_cccp, "metrics": ec}
+
+    # Save json
+    if args.out:
         with open(args.out, "w") as f:
-            json.dump(out, f, indent=2)
-        print(f"\n[saved] {args.out}")
+            json.dump(all_out, f, indent=2)
+        print(f"[saved] {args.out}")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-

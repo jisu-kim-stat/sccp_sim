@@ -41,30 +41,24 @@ python3 train_cifar100_lt.py \
 
 ## 2. GCP/CCCP/SCCP실행 
 ```bash
-python3 run_cp_from_npz.py \
-  --npz "/home/jisukim/sccp_sim/cifar100/out/cifar100LT_probs/cifar100_resnet101_e100_bs128_LT_exp_IF100_tailfrac0.2.npz" \
+python3 scripts/run_cp_from_npz.py \
+  --npz "/home/jisukim/sccp_sim/cifar100/out/cifar100LT_probs/cifar100_resnet152_e30_bs128_LT_exp_IF100_tailfrac0.2_cal20_sd1_st1.npz" \
   --K 100 \
   --alpha 0.1 \
+  --seed 1 \
+  --score softmax \
+  --emb_source score\
   --clusters 10 \
   --tau 50 \
-  --seed 1 \
-  --embed score_quantile
+  --beta 0.5 \
+  --tail_mode npz \
+  --tail_frac 0.2 \
+  --run_cccp \
+  --cccp_gamma 0.5 \
+  --cccp_M 10
 ```
 - 출력 : overall coverage / set size, tail_head coverage/ set size, classwise, clusterwise 요약 지표
 - `--clusters`는 non_null cluster 개수이며, null cluster는 자동으로 추가될 수 있음 (샘플 희소 정도에 따라 결정)
-
-## Hyperparameter Selection 
-### tau sweep 
-```bash
-python run_cp_from_npz.py \
-  --npz "/home/jisukim/sccp_sim/cifar100/out/cifar100LT_probs/cifar100_resnet50_e100_bs128_LT_exp_IF100_tailfrac0.2.npz" \
-  --alpha 0.1 --K 100 --seed 1 \
-  --sweep \
-  --tau_list 0,1,5,10,20,50,100,200 \
-  --clusters_list 5,10,20 \
-  --embed score_quantile
-```
-- sweep 출력 결과를 보고 가장 안정적인 tau/cluster 조합 선택 후 단일 실행으로 결과를 저장. 
 
 
 ## Export to latex table ###
