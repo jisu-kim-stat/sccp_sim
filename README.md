@@ -49,12 +49,10 @@ iNat2017은 실제 자연 환경에서 수집된 대규모 이미지 분류 데�
 
 ### 실행 예시
 ```bash
-python3 make_inat_image_stratified_family.py \
-  --inat_root "data/inat2017_raw" \
-  --train_json "data/inat2017_raw/train2017.json" \
-  --val_json   "data/inat2017_raw/val2017.json" \
-  --cat_to_family_json "data/inat2017_meta_family/category_to_family.json" \
-  --out_npz "data/npz/inat2017_images_family_strat_t50k_c30k_te10k_seed1.npz" \
+python3 scripts/make_inat_image_stratified_family.py \
+  --tfds_dir "/home/jisukim/sccp_sim/data/tfds/i_naturalist2017/0.1.0" \
+  --cat_to_family_json "/home/jisukim/sccp_sim/data/inat2017_meta_family/category_to_family.json" \
+  --out_npz "/home/jisukim/sccp_sim/data/npz/inat2017_images_family_strat_t50k_c30k_te10k_seed1.npz" \
   --seed 1 \
   --image_size 224 \
   --n_train 50000 \
@@ -63,8 +61,14 @@ python3 make_inat_image_stratified_family.py \
   --min_family_count 250 \
   --min_test_per_family 1 \
   --min_calib_per_family 1 \
+  --use_tfds_test_for_test \
   --save_indices
 ```
+
+- train+validation을 합쳐서 하나의 pool로 만든 후, 그 안에서 다시 분할로 만듦. 
+- pass 1 : 라벨 스캔 후 family label로 변환하고, family별 샘플 개수 집계해서 `min_family_count` 이상인 것들만 남김. 남은 것들에 대해 stratified하게 train/val/test 개수 할당 후 pool index list 생성 (`idx_train`,`idx_calib`,`idx_test`)
+- pass 2 : pool을 다시 처음부터 끝까지 읽으면서, 인덱스에 해당하는 샘플만 골라서 저장. 이때 이미지를 디코딩-resize-uint8배열로 저장해서 `X_train, X_calib, X_test` 생성.
+- test의 경우, 일단 train+val pool에서 생성함. (이후 논문용 최종 시험에서는 TFDS내의 `test`를 이용해서 따로 생성할 필요 있음. 일단은 전체적인 경향만 볼 것! - 02/05 )
 
 ### 생성 파일
 iNaturalist 2017 데이터로부터 family-level label 기준의 stratified split을 생성한다. 생성 파일은 다음을 포함한다.
