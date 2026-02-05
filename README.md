@@ -50,162 +50,121 @@ iNat2017은 실제 자연 환경에서 수집된 대규모 이미지 분류 데�
 ### 실행 예시
 ```bash
 python3 scripts/make_inat_image_stratified_family.py \
-  --tfds_dir "/home/jisukim/sccp_sim/data/tfds/i_naturalist2017/0.1.0" \
-  --cat_to_family_json "/home/jisukim/sccp_sim/data/inat2017_meta_family/category_to_family.json" \
-  --out_npz "/home/jisukim/sccp_sim/data/npz/inat2017_images_family_strat_t50k_c30k_te10k_seed1.npz" \
+  --data_dir "data/tfds" \
+  --pool_split "train+validation" \
+  --cat_to_family_json "data/inat2017_meta_family/category_to_family.json" \
+  --out_npz "data/npz/inat2017_images_family_dingstyle_seed1.npz" \
   --seed 1 \
   --image_size 224 \
-  --n_train 50000 \
-  --n_calib 30000 \
-  --n_test 10000 \
   --min_family_count 250 \
-  --min_test_per_family 1 \
-  --min_calib_per_family 1 \
-  --use_tfds_test_for_test \
+  --train_frac 0.7 \
+  --sel_frac 0.1 \
+  --cal_frac 0.1 \
+  --test_frac 0.1 \
   --save_indices
 ```
 
-- train+validation을 합쳐서 하나의 pool로 만든 후, 그 안에서 다시 분할로 만듦. 
-- pass 1 : 라벨 스캔 후 family label로 변환하고, family별 샘플 개수 집계해서 `min_family_count` 이상인 것들만 남김. 남은 것들에 대해 stratified하게 train/val/test 개수 할당 후 pool index list 생성 (`idx_train`,`idx_calib`,`idx_test`)
-- pass 2 : pool을 다시 처음부터 끝까지 읽으면서, 인덱스에 해당하는 샘플만 골라서 저장. 이때 이미지를 디코딩-resize-uint8배열로 저장해서 `X_train, X_calib, X_test` 생성.
-- test의 경우, 일단 train+val pool에서 생성함. (이후 논문용 최종 시험에서는 TFDS내의 `test`를 이용해서 따로 생성할 필요 있음. 일단은 전체적인 경향만 볼 것! - 02/05 )
-
 ### 생성 파일
-iNaturalist 2017 데이터로부터 family-level label 기준의 stratified split을 생성한다. 생성 파일은 다음을 포함한다.
-- `X_train`, `X_cal`, `X_test` : 이미지 데이터
-- `y_train`, `y_cal`, `y_test` : 정답 레이블
-- `idx_train`, `idx_calib`, `idx_test` (Optional) : 전체 pool 기준 인덱스
-- `meta` : family 매핑 정보 및 데이터 생성 설덩
+iNaturalist 2017 데이터로부터 family-level label 기준의 stratified split을 생성한다.
+Species-level 라벨을 family-level로 변환한 뒤, `train+validation` 풀을 집계해서 각 family별로 동일한 비율을 갖도록 분할한다.
+생성된 NPZ 파일에는 다음이 포함된다.
+- 이미지 데이터
+  -  `X_train` : 모델 학습용 이미지
+  -  `X_sel` : selection (cluster / hyperparameter 선택)용 이미지
+  -  `X_cal` : conformal calibration용 이미지
+  -  `X_test` : 평가용 이미지
+- 정답 label (family-level) : `y_train, y_sel, y_cal, y_test`
+- 인덱스 정보 (Optional) : `idx_train, idx_sel, idx_cal, idx_test `
+  (train+validation pool 기준의 인덱스)
+- 메타데이터
+  - `meta` : 
+    - species -> family 매핑 정보
+    - 사용된 split 비율
+    - 필터링된 family 조건
+    - 데이터 생성 설정 (seed, image size 등)
 
 ### 참고
-- `--min_family_count` 보다 수가 적은 family는 사전에 제거됨.
-- 모든 split은 family 분포를 유지하도록 stratified sampling됨.
-
+- Ding et al. (2025)와 비슷하게 split한다 : calibration과 test가 동일한 분포를 갖도록 설계되어, conformal prediction의 exchangeability 가정을 만족한다.
+- Family-level split을 사용함으로써, species-level의 극단적인 long-tail로 인한 불안정성을 완화한다.
+- `--save_indices` 옵션을 사용하면 동일한 pool 기준에서 실험 재현이 가능하다.
 
 ---
 
 ## 3. 모델 학습 및 확률 NPZ 생성
-앞서 변환한 이미지 NPZ 파일을 input으로 하고, 확률 NPZ 를 output으로 하는 모델을 학습한다. 이 단계의 목적은 각 이미지에 대한 class probability를 얻는 것이며, 모델의 분류 정확도 자체는 Conformal prediction 방법 특성상 크게 중요하지 않다. 그러나 정확도가 너무 낮은 모델의 경우에는 class probability가 거의 동일하여 자칫 prediction set size를 너무 크게 만들 수 있으므로, 정확도가 너무 낮은 모델을 사용하는 것에는 주의가 필요하다. 
+앞서 변환한 이미지 NPZ 파일을 입력으로 사용하여, 각 이미지에 대한 class probability를 산출하는 분류 모델을 학습한다.
+이 단계의 핵심 목적은 Conformal Prediction에 사용될 확률 벡터(probability vector)를 생성하는 것이며,
+모델의 분류 정확도 자체는 Conformal Prediction 방법의 특성상 최우선 목표는 아니다.
 
-### 실행 예시 (ResNet50, head-only)
+다만, 모델의 성능이 지나치게 낮을 경우 모든 클래스에 대해 확률이 거의 균등하게 분포하게 되어
+prediction set의 크기가 불필요하게 커질 수 있다.
+따라서 확률 분포가 의미 있게 분리될 수 있을 정도의 최소한의 분류 성능은 확보되어야 하며,
+정확도가 극단적으로 낮은 모델을 사용하는 것은 지양한다.
+
+본 실험에서는 사전학습된 ImageNet 가중치를 초기값으로 사용하는 표준 CNN 모델을 사용하여
+위 목적에 부합하는 class probability를 생성한다.
+
+### 실행 예시 (ResNet50)
 ```bash
-python3 scripts/train_and_export_probs_inat.py \
-  --img_npz data/npz/inat2017_images_strat_t50k_v30k_te10k_seed1.npz \
-  --out_prob_npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
-  --model resnet50 \
-  --finetune head \
-  --epochs 10 \
+python3 scripts/train_and_export_probs_inat_family.py \
+  --img_npz data/npz/inat2017_images_family_dingstyle_seed1.npz \
+  --out_npz data/npz/inat2017_probs_family_resnet50_seed1.npz \
+  --epochs 20 \
   --batch_size 128 \
-  --lr 1e-3 \
-  --weight_decay 1e-4 \
-  --calib_split_seed 1 \
+  --lr 1e-4 \
+  --finetune full \
+  --num_workers 8 \
+  --amp \
   --seed 1
+
 ```
 
 
 ### 출력 파일
 ```bash
 data/npz/
-└── inat2017_probs_selA_calB_test_rn50_head_t50k_ep10_seed1.npz
+└── inat2017_probs_family_resnet50_seed1.npz
 ```
-이 확률 NPZ 파일은 이후의 Conformal Prediction 방법들의 input으로 사용된다. 
+해당 확률 NPZ 파일은 이후 단계에서 수행되는
+Conformal Prediction 및 변형된 CP 방법들의 입력 데이터로 사용된다.
+파일에는 selection, calibration, test split에 대한 class probability, label,
+그리고 필요 시 score 계산을 위한 logits 정보가 함께 저장된다.
 
 ---
 
 ## 4. Conformal Prediction
+본 단계에서는 앞서 학습된 분류 모델로부터 얻은 class probability를 입력으로 하여
+Conformal Prediction 방법을 적용하고, 예측 집합(prediction set)의 특성을 평가한다.
+단순히 marginal coverage를 맞추는 것이 아니라,
+class imbalance 환경에서 tail class의 과도한 prediction set 확장을 완화하는 방법을 비교·분석하는 것을 목적으로 한다.
 
-### 비교 방법
-- **GCP (Global Conformal Prediction)**  
-  A baseline conformal prediction method using a global threshold  
-  [Vovk et al., 2005; Angelopoulos et al., 2022].
-
-- **CC-CP (Class-Conditional Conformal Prediction)**  
-  Class-wise conformal thresholds  
-  [Ding et al., 2023].
-
-- **SCCP (Shrinkage-Clustered Conformal Prediction)**  
-  Clustered and shrinkage-based conformal thresholds (ours).
-
----
-
-## 5. SCCP 
-### 5.1 Class Embedding
-- calibration data에서 각 클래스별 score 수집
-- score quantile embedding (Simulation) or mean embedding (iNat2017)
-### 5.2 Clustering
-- embedding vector에 대해 kmeans clustering 적용
-- `Kc` : Cluster number (default = 10)
-### 5.3 Shrinkage
-- cluster 단위로 shrinkage parameter `lambda_hat` 학습
-- tail class에 대한 prediction set size를 줄이는 것이 목적
+이를 위해, score shrinkage가 적용된 localized / class-conditional conformal prediction (LCCP) 방법을 사용한다.
 
 ### 실행 예시
 ```bash
-# (1) Softmax score로 CP 수행 + SCCP 클러스터링은 logit 기반 임베딩 사용
-python scripts/run_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
-  --K 5089 --alpha 0.1 --seed 1 \
-  --score softmax \
-  --emb_source logit \
-  --weighted_kmeans \
-  --clusters 10 --tau 50 --beta 0.5 \
-  --tail_mode npz --tail_frac 0.2
+python scripts/run_cp_from_npz_new.py \
+  --npz data/npz/inat2017_probs_family_resnet50_seed1.npz \
+  --K 173 \
+  --alpha 0.1 \
+  --seed 1
 ```
-```bash
-# (2) 위와 동일 + CCCP(Ding) 결과도 같이 출력
-python scripts/run_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
-  --K 5089 --alpha 0.1 --seed 1 \
-  --score softmax \
-  --emb_source logit \
-  --weighted_kmeans \
-  --clusters 10 --tau 50 --beta 0.5 \
-  --tail_mode npz --tail_frac 0.2 \
-  --run_cccp \
-  --cccp_gamma 0.5 --cccp_M 10
-```
-```bash
-# (3) APS / RAPS도 같은 설정으로 비교 (score만 바꿔서 반복)
-python scripts/run_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
-  --K 5089 --alpha 0.1 --seed 1 \
-  --score aps \
-  --emb_source logit \
-  --weighted_kmeans \
-  --clusters 10 --tau 50 --beta 0.5 \
-  --tail_mode npz --tail_frac 0.2
 
-python scripts/run_cp_from_npz.py \
-  --npz data/npz/inat2017_probs_strat_selA_calB_test_rn50_head_t50k_ep10_seed1.npz \
-  --K 5089 --alpha 0.1 --seed 1 \
-  --score raps --raps_lambda 0.05 --raps_kreg 5 \
-  --emb_source logit \
-  --weighted_kmeans \
-  --clusters 10 --tau 50 --beta 0.5 \
-  --tail_mode npz --tail_frac 0.2
-```
-#### Option
-- `--score softmax|aps|raps` : 예측집합을 만드는 CP score
-- `--emb_source logit` : SCCP에서 클래스 클러스터링 임베딩만 logit 기반으로 생성
-- `--weighted_kmeans` : 클래스별 표본수에 비례한 가중치로 K-means
-- `--clusters Kc, --tau, --beta` : SCCP 하이퍼파라미터
----
-
-## 6. 출력 및 평가 지표
-기본 출력 지표는 다음과 같다. 
+### 출력 및 평가 지표
 - Marginal coverage
-- Average set size
-- Coverage gap
-- Tail/Head coverage
-- Tail/Head set size
----
-
-
+- Average prediction set size
+- Tail class coverage
+- HEad class coverage
+- Tail / Head prediction set size
+- Worst-case class coverage (Optional)
+Tail class는 training pool에서 표본 수가 하위 `tail_frac`에 해당하는 클래스로 정의한다.
 
 # References
 - Vovk, V., Gammerman, A., and Shafer, G. (2005).
 *Algorithmic Learning in a Random World*.
 Springer.
+
+- Ding, T., Fermanian, J.-B., and Salmon, J. (2025).
+*Conformal Predcition for Long-Tailed Classification*.
+arXiv preprint.
 
 - Angelopoulos, A. N., Bates, S., Malik, J., and Jordan, M. I. (2022).
 *Uncertainty Sets for Image Classifiers using Conformal Prediction*.
