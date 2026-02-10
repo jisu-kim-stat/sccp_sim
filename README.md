@@ -141,11 +141,15 @@ class imbalance 환경에서 tail class의 과도한 prediction set 확장을 �
 
 ### 실행 예시
 ```bash
-python scripts/run_cp_from_npz_new.py \
+python3 scripts/run_score_shrink_lccp_v2.py \
   --npz data/npz/inat2017_probs_family_resnet50_seed1.npz \
   --K 173 \
   --alpha 0.1 \
-  --seed 1
+  --tau_grid "0,0.5,1,2,5,10,20,50,100,200" \
+  --tail_frac 0.2 \
+  --tune_eps 0.01 \
+  --print_tau_table \
+  --out_json out/results/score_shrink_lccp_full_ep20_D2_entropy.json
 ```
 
 ### 출력 및 평가 지표
