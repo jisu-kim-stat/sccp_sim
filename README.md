@@ -137,7 +137,8 @@ Conformal Prediction 방법을 적용하고, 예측 집합(prediction set)의 �
 단순히 marginal coverage를 맞추는 것이 아니라,
 class imbalance 환경에서 tail class의 과도한 prediction set 확장을 완화하는 방법을 비교·분석하는 것을 목적으로 한다.
 
-이를 위해, score shrinkage가 적용된 localized / class-conditional conformal prediction (LCCP) 방법을 사용한다.
+이를 위해, score shrinkage가 적용된 localized / class-conditional conformal prediction (LCCP) 방법을 사용한다. (0210- Shrinkage Score LCCP로 방법 수정)
+
 
 ### 실행 예시
 ```bash

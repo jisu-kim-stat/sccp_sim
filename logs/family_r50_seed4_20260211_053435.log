@@ -1,0 +1,5 @@
+===== Running seed 4 =====
+/data1/jisukim/sccp_sim/scripts/train_and_export_probs_inat_family.py:209: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler(enabled=amp)
+[train] epochs=20, lr=0.0001, finetune=full
+===== seed 4 DONE | exit_code=137 =====
