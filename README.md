@@ -134,33 +134,55 @@ Conformal Prediction 및 변형된 CP 방법들의 입력 데이터로 사용된
 ## 4. Conformal Prediction
 본 단계에서는 앞서 학습된 분류 모델로부터 얻은 class probability를 입력으로 하여
 Conformal Prediction 방법을 적용하고, 예측 집합(prediction set)의 특성을 평가한다.
-단순히 marginal coverage를 맞추는 것이 아니라,
-class imbalance 환경에서 tail class의 과도한 prediction set 확장을 완화하는 방법을 비교·분석하는 것을 목적으로 한다.
+단순히 marginal coverage를 맞추는 것뿐 아니라,
+class imbalance 환경에서 tail class에서의 과도한 prediction set 확장(set size inflation)을 완화하는 방법을 비교·분석하는 것을 목적으로 한다.
 
-이를 위해, score shrinkage가 적용된 localized / class-conditional conformal prediction (LCCP) 방법을 사용한다. (0210- Shrinkage Score LCCP로 방법 수정)
+이를 위해 다음 세 가지 방법을 비교한다.
+
+- LCCP (classwise): 클래스별 calibration만 사용하는 class-conditional conformal prediction
+
+- CCCP (clusterwise): 클래스들을 score 분포 유사도 기반으로 클러스터링하여, cluster 단위로 calibration을 공유하는 방법
+
+- SCCP (class–cluster shrinkage): classwise 정보와 clusterwise 정보를 shrinkage로 결합하는 방법. 
+
+클러스터링은 calibration 데이터에서 얻은 true-label score의 empirical quantile 벡터(quantile embedding)를 사용하고, k-means로 클래스 클러스터를 구성한다.
 
 
 ### 실행 예시
 ```bash
-python3 scripts/run_score_shrink_lccp_v2.py \
+python3 scripts/run_sccp_class_cluster.py \
   --npz data/npz/inat2017_probs_family_resnet50_seed1.npz \
   --K 173 \
   --alpha 0.1 \
+  --M 25 \
+  --n_clusters 20 \
+  --cluster_seed 1 \
   --tau_grid "0,0.5,1,2,5,10,20,50,100,200" \
   --tail_frac 0.2 \
   --tune_eps 0.01 \
   --print_tau_table \
-  --out_json out/results/score_shrink_lccp_full_ep20_D2_entropy.json
+  --out_json out/results/sccp_class_cluster_seed1.json
 ```
 
 ### 출력 및 평가 지표
+스크립트는 TEST set에서 LCCP / CCCP / SCCP 각각에 대해 아래 지표를 출력한다.
+
 - Marginal coverage
+
 - Average prediction set size
-- Tail class coverage
-- HEad class coverage
-- Tail / Head prediction set size
-- Worst-case class coverage (Optional)
-Tail class는 training pool에서 표본 수가 하위 `tail_frac`에 해당하는 클래스로 정의한다.
+
+- Average class-wise coverage (avg_class_cov)
+
+- Worst-case class coverage (worst_class_cov)
+
+- Tail / Head coverage (cov_tail, cov_head)
+
+- Tail / Head prediction set size (size_tail, size_head)
+
+- (참고) class-wise coverage 분산: std_class_cov, 그리고 deviation 지표: covgap, maxgap
+
+또한 selection set에서 τ 후보별 성능 요약 테이블을 출력하며(--print_tau_table),
+제약을 만족하는 후보 중 목적함수에 따라 best_tau를 선택한다.
 
 # References
 - Vovk, V., Gammerman, A., and Shafer, G. (2005).
